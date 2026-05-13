@@ -113,3 +113,7 @@ issues.jsonl
 .beads-credential-key
 .sageox/kb/
 security/.output/
+
+# Nix
+/.pre-commit-config.yaml
+/result
