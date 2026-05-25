@@ -42,6 +42,11 @@
             ../../../tests
           ];
         };
+        subPackages = [
+          "cmd/ox"
+          "cmd/ox-adapter-claude-code"
+          "cmd/ox-adapter-codex"
+        ];
         vendorHash = "sha256-ET+Y4YKgNCMnCNJjcqN8hb0EjE62XJBavhqgfNeqX0Y=";
         # FIXME: TestExtractGitHubFacts* requires `git` on PATH
         doCheck = false;
