@@ -7,7 +7,7 @@
     ...
   }: {
     devshells.default = {
-      packages = with pkgs; [dolt git-lfs];
+      packages = with pkgs; [dolt gcc git-lfs gnumake golangci-lint gotools];
       packagesFrom = [config.packages.ox];
     };
 
@@ -19,8 +19,11 @@
           pkgs.dolt
           pkgs.git-lfs
         ])
-        (readonly (noescape "~/.config/sageox"))
+        (readwrite (noescape "~/.config/sageox"))
         (readwrite (noescape "~/.local/share/sageox"))
+        (add-runtime ''
+          RUNTIME_ARGS+=(--bind "$XDG_RUNTIME_DIR/sageox" "$XDG_RUNTIME_DIR/sageox")
+        '')
       ];
 
     packages = {
