@@ -22,6 +22,7 @@
         (readwrite (noescape "~/.config/sageox"))
         (readwrite (noescape "~/.local/share/sageox"))
         (add-runtime ''
+          # NOTE: This is where the IPC socket lands. Must already exist!
           RUNTIME_ARGS+=(--bind "$XDG_RUNTIME_DIR/sageox" "$XDG_RUNTIME_DIR/sageox")
         '')
       ];
@@ -30,7 +31,7 @@
       default = config.packages.ox;
       ox = pkgs.buildGoModule (finalAttrs: {
         pname = "ox";
-        version = "0.8.1"; # internal/version/version.go
+        version = "0.8.1"; # internal/version/version.go:5
         src = lib.fileset.toSource {
           root = ../../..;
           fileset = lib.fileset.unions [
@@ -51,7 +52,7 @@
           "cmd/ox-adapter-codex"
         ];
         vendorHash = "sha256-ET+Y4YKgNCMnCNJjcqN8hb0EjE62XJBavhqgfNeqX0Y=";
-        # FIXME: TestExtractGitHubFacts* requires `git` on PATH
+        # FIXME: TestExtractGitHubFacts* require `git` on PATH
         doCheck = false;
       });
     };

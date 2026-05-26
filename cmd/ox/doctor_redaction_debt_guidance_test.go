@@ -30,9 +30,9 @@ import (
 //  3. Extracts every `ox session redact ...` line from the detail.
 //  4. For each line, invokes the real cobra command tree with those
 //     args and asserts:
-//        - parsing succeeds (no `unknown flag` / `unknown command`)
-//        - the resolved command is `ox session redact`
-//        - --session is populated with the expected session name
+//     - parsing succeeds (no `unknown flag` / `unknown command`)
+//     - the resolved command is `ox session redact`
+//     - --session is populated with the expected session name
 //
 // Failure prevented: doctor recovery copy emits a command shape cobra
 // doesn't actually support — the user pastes it, cobra "accepts" it

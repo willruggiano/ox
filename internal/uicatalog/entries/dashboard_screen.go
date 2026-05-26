@@ -67,7 +67,7 @@ func init() {
 					dim("4m ago") + "\n\n" +
 					"refactoring\nuicatalog\n\n" +
 					dim("files:") + "\n" +
-					dim("docs/design/")+"\n" +
+					dim("docs/design/") + "\n" +
 					dim("registry.go"),
 			)
 
