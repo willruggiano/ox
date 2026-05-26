@@ -8,11 +8,7 @@
     devshells.default.packages = [config.packages.claude-code];
 
     jail = {
-      git.user.email = "noreply@anthropic.com";
-      git.user.name = config.packages.claude-code-unwrapped.name;
-
       programs.claude = {
-        package = config.packages.claude-code-unwrapped;
         additionalCombinators = cs:
           with cs; [
             (add-pkg-deps [
@@ -20,14 +16,14 @@
             ])
             (readwrite (noescape "~/.claude"))
             (readwrite (noescape "~/.claude.json"))
-            (set-env "CLAUDE_CODE_EFFORT_LEVEL" "max")
             (set-env "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" "1")
             (wrap-entry (entry: ''
-              # The program is already sandboxed. For this reason we opt to
-              # start in this mode to facilitate rapid iteration.
-              ${entry} --allow-dangerously-skip-permissions --dangerously-skip-permissions
+              ${entry} --allow-dangerously-skip-permissions
             ''))
           ];
+        git.user.email = "noreply@anthropic.com";
+        git.user.name = config.packages.claude-code-unwrapped.name;
+        package = config.packages.claude-code-unwrapped;
       };
     };
 
