@@ -31,7 +31,7 @@
       default = config.packages.ox;
       ox = pkgs.buildGoModule (finalAttrs: {
         pname = "ox";
-        version = "0.8.1"; # internal/version/version.go:5
+        version = "0.9.0"; # internal/version/version.go:5
         src = lib.fileset.toSource {
           root = ../../..;
           fileset = lib.fileset.unions [
@@ -51,7 +51,7 @@
           "cmd/ox-adapter-claude-code"
           "cmd/ox-adapter-codex"
         ];
-        vendorHash = "sha256-ET+Y4YKgNCMnCNJjcqN8hb0EjE62XJBavhqgfNeqX0Y=";
+        vendorHash = "sha256-W0SHxFIIaW4YKiej2ks9unZNnaCf4MrvIaLZWFIQ4gc=";
         # FIXME: TestExtractGitHubFacts* require `git` on PATH
         doCheck = false;
       });
