@@ -450,6 +450,23 @@ func matchSkipped(match string, skipIf []string) bool {
 	return false
 }
 
+// RedactPrompt scans and redacts secrets from a free-form user prompt
+// string before it is transmitted off-machine. Returns the redacted text
+// and the count of distinct patterns that matched (suitable for
+// telemetry — never log the raw matched content).
+//
+// This is the canonical entry point for cloud-bound prompt redaction (see
+// ox-8wmo). It is intentionally a thin wrapper over RedactString so the
+// same built-in catalog + any user-loaded extra rules apply uniformly to
+// session entries AND cloud-query inputs. If a future prompt-specific
+// rule is needed (e.g. stripping pasted .env blocks even harder than the
+// generic patterns do), add it to DefaultPatterns or load it via
+// AddPattern — do NOT fork the redactor with a parallel ruleset.
+func (r *Redactor) RedactPrompt(prompt string) (redacted string, patternCount int) {
+	out, found := r.RedactString(prompt)
+	return out, len(found)
+}
+
 // RedactString scans and redacts secrets from a string.
 // Returns the redacted output and a list of pattern names that matched.
 //

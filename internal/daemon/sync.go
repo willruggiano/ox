@@ -43,6 +43,7 @@ import (
 	"github.com/sageox/ox/internal/gitutil"
 	"github.com/sageox/ox/internal/ledger"
 	"github.com/sageox/ox/internal/observability"
+	"github.com/sageox/ox/internal/perf"
 	"github.com/sageox/ox/internal/version"
 	whisperstore "github.com/sageox/ox/internal/whisper/store"
 )
@@ -55,8 +56,14 @@ const (
 
 	// teamDiscoveryInterval is how often we re-fetch the team list from the API,
 	// independent of credential token expiry. This ensures new teams are discovered
-	// promptly even when the token is still fresh.
-	teamDiscoveryInterval = 5 * time.Minute
+	// without waiting for the next credential refresh.
+	//
+	// 1h is a deliberate trade-off: team membership changes are rare (admin adds
+	// a member, user joins a new team), so the previous 5min cadence cost ~12x
+	// the API load for no perceptible UX gain. New-team discovery still happens
+	// opportunistically on credential refresh and on explicit user actions
+	// (`ox status`, `ox doctor`).
+	teamDiscoveryInterval = 1 * time.Hour
 
 	// maxConcurrentClones limits background clone operations to prevent resource exhaustion.
 	// 100 team contexts shouldn't spawn 100 concurrent git clones.
@@ -1047,6 +1054,12 @@ func (s *SyncScheduler) LastSync() time.Time {
 // Also performs anti-entropy: checks for missing workspaces and triggers clones.
 // Errors from doPull are already logged and recorded; background sync continues.
 func (s *SyncScheduler) pullChanges(ctx context.Context) {
+	// Open a root span for this pull cycle. Child spans (do_pull,
+	// managed_repo, fetch, rebase, ...) nest under it so the daemon
+	// log tree shows each cycle as one self-contained block.
+	ctx, span := s.tracer.StartTask(ctx, "daemon:pull_cycle")
+	defer span.End()
+
 	// anti-entropy: ensure missing workspaces get cloned
 	s.triggerMissingClones()
 
@@ -1201,6 +1214,8 @@ func isValidGitRepo(path string) bool {
 //   - lock file safety: if a git process crashes, its .git/index.lock is released
 //     by the OS; an in-process crash may leave stale locks in the same process
 func (s *SyncScheduler) doPull(ctx context.Context, progress *ProgressWriter, forceSync bool, refreshSparse bool) error {
+	ctx, span := perf.Start(ctx, "daemon:do_pull")
+	defer span.End()
 	if s.config.LedgerPath == "" {
 		return nil
 	}
@@ -1444,6 +1459,9 @@ func (s *SyncScheduler) doPull(ctx context.Context, progress *ProgressWriter, fo
 // Called during the ledger sync cycle for natural batching (~60s).
 // Non-fatal: failures are logged but don't block the sync cycle.
 func (s *SyncScheduler) pushMurmurCommits(ctx context.Context, ledgerPath string) {
+	ctx, span := perf.Start(ctx, "daemon:push_murmurs")
+	defer span.End()
+
 	// check for unpushed murmur commits
 	out, err := s.git.RunGit(ctx, ledgerPath, "log", "--oneline", "origin/main..HEAD", "--", "data/murmurs/")
 	if err != nil || strings.TrimSpace(out) == "" {

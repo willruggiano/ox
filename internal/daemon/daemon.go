@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,11 +32,17 @@ import (
 	"github.com/sageox/ox/internal/ledger"
 	"github.com/sageox/ox/internal/observability"
 	"github.com/sageox/ox/internal/paths"
+	"github.com/sageox/ox/internal/perf"
 	"github.com/sageox/ox/internal/session"
 	"github.com/sageox/ox/internal/session/adapters"
 	"github.com/sageox/ox/internal/version"
 	whisperstore "github.com/sageox/ox/internal/whisper/store"
 )
+
+// daemonGCPercent is the GC target (GOGC) applied at startup when the operator
+// hasn't set GOGC. Lower than the default 100 to cap the heap high-water during
+// allocation-heavy CodeDB indexing. See Start() for the rationale and numbers.
+const daemonGCPercent = 50
 
 // Version returns the daemon version including build timestamp.
 // Used for heartbeat version comparison to detect when CLI has been rebuilt.
@@ -346,6 +353,17 @@ func (d *Daemon) Start() error {
 	d.mu.Unlock()
 
 	d.logger.Info("daemon starting", "ledger", d.config.LedgerPath, "version", Version())
+
+	// Memory footprint: CodeDB indexing is allocation-heavy (tree-sitter parsing
+	// churns multiple GB). At the default GOGC=100 the heap grows to ~2x live
+	// before a collection, which roughly doubled the daemon's RSS high-water
+	// during indexing (measured ~1.5 GB peak → ~0.7 GB at GOGC=50, ~10% more GC
+	// CPU during heavy phases — a good trade for a background daemon). Respect an
+	// explicit operator GOGC; only apply the tighter default when unset.
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(daemonGCPercent)
+		d.logger.Debug("set GC target", "gogc", daemonGCPercent)
+	}
 
 	// write PID file (informational only)
 	if err := d.writePidFile(); err != nil {
@@ -1079,7 +1097,26 @@ func (d *Daemon) initComponents() time.Duration {
 		if env := os.Getenv("AGENT_ENV"); env != "" {
 			daemonAttrs = append(daemonAttrs, attribute.String(observability.AttrAgentEnv, env))
 		}
-		if err := observability.Init(d.ctx, "ox-daemon", apiEndpoint, daemonAttrs...); err != nil {
+		// The OTLP proxy is JWT-gated. The daemon is long-running and the
+		// stored token rotates on refresh, so resolve per-export via this
+		// closure rather than baking a static header at Init time.
+		tokenFunc := func() string {
+			tok, err := auth.GetTokenForEndpoint(apiEndpoint)
+			if err != nil || tok == nil {
+				return ""
+			}
+			return tok.AccessToken
+		}
+		// Install perf processor BEFORE Init so the daemon's tree sink
+		// receives every span the OTLP exporter does. Per-span slog is
+		// gated by duration (>=100ms) and OX_TRACE; tree rendering to
+		// the daemon log is gated on OX_TRACE only — both are
+		// configured inside the perf sinks themselves.
+		observability.AddSpanProcessor(perf.NewTreeProcessor(perf.Options{
+			OnSpan: perf.PerSpanSlog(d.logger),
+			OnTree: perf.DaemonTreeSink(d.logger),
+		}))
+		if err := observability.Init(d.ctx, "ox-daemon", apiEndpoint, tokenFunc, daemonAttrs...); err != nil {
 			d.logger.Warn("otel tracing init failed", "error", err)
 		}
 		d.tracer = observability.NewDaemonTracer()
@@ -1352,6 +1389,10 @@ func (d *Daemon) startWorkers() {
 			}()
 		}
 		ws.Start(d.ctx, &d.wg)
+		// release team whisper SQLite FDs that have been idle for a while.
+		// Whispers are an every-few-minutes workload, so holding every team
+		// DB open between operations leaks ~3 FDs per team for no benefit.
+		ws.RunIdleCloseJanitor(d.ctx, &d.wg, DefaultIdleCloseInterval, DefaultIdleCloseThreshold)
 	}
 
 	d.wg.Add(1)

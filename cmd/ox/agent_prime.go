@@ -25,6 +25,7 @@ import (
 	"github.com/sageox/ox/internal/daemon"
 	"github.com/sageox/ox/internal/doctor"
 	"github.com/sageox/ox/internal/endpoint"
+	"github.com/sageox/ox/internal/ephemeral"
 	"github.com/sageox/ox/internal/identity"
 	"github.com/sageox/ox/internal/kb"
 	"github.com/sageox/ox/internal/ledger"
@@ -32,6 +33,7 @@ import (
 	"github.com/sageox/ox/internal/prime"
 	"github.com/sageox/ox/internal/proc"
 	"github.com/sageox/ox/internal/repotools"
+	"github.com/sageox/ox/internal/runtime"
 	"github.com/sageox/ox/internal/session"
 	"github.com/sageox/ox/internal/session/adapters"
 	"github.com/sageox/ox/internal/teamdocs"
@@ -122,6 +124,20 @@ func initAgentPrimeCmd() {
 	// When true and marker exists: outputs nothing, exits 0 (saves ~1k tokens).
 	// When false (default): always outputs context (safe, may waste tokens on duplicate calls).
 	agentPrimeCmd.Flags().Bool("idempotent", false, "Skip priming if session already primed (token optimization)")
+
+	// DEPRECATED: --ephemeral is retained for one release as a hidden flag.
+	// Operators have moved to setting OX_EPHEMERAL=1 in their hook env
+	// file (e.g. $CLAUDE_ENV_FILE), which is the only form that survives
+	// across multiple ox invocations in the same shell session. os.Setenv
+	// only writes the current process's env per POSIX — so the flag, set
+	// on `ox agent prime` alone, gave the first command ephemeral
+	// behavior and let subsequent commands silently drift back to
+	// non-ephemeral. False sense of security.
+	//
+	// runAgentPrime emits a stderr deprecation warning when the flag is
+	// passed; removal is tracked as a follow-up issue.
+	agentPrimeCmd.Flags().Bool("ephemeral", false, "DEPRECATED: set OX_EPHEMERAL=1 in your environment instead")
+	_ = agentPrimeCmd.Flags().MarkHidden("ephemeral")
 }
 
 // runAgentPrime bootstraps a new agent instance with team context.
@@ -141,6 +157,29 @@ func initAgentPrimeCmd() {
 // so ox cannot intercept this invocation. Users must run `claude` without a prompt
 // argument to allow the session-start hook to run `ox agent prime` first.
 func runAgentPrime(cmd *cobra.Command, args []string) error {
+	// Deprecation handling for --ephemeral: warn loudly and propagate the
+	// env var so the in-process subsystems still behave correctly for
+	// this one invocation. The warning calls out the actual fix
+	// (write to the env file) so the operator doesn't reach for the
+	// same flag next time.
+	if ephemeralFlag, _ := cmd.Flags().GetBool("ephemeral"); ephemeralFlag {
+		fmt.Fprintln(os.Stderr, "warning: --ephemeral is deprecated and will be removed in a future release.")
+		fmt.Fprintln(os.Stderr, "  Set OX_EPHEMERAL=1 in your environment instead (e.g. write it to $CLAUDE_ENV_FILE before running ox).")
+		fmt.Fprintln(os.Stderr, "  Reason: a flag on a single command only affects that process; subsequent ox invocations in the same shell would silently drift back to non-ephemeral.")
+		if os.Getenv(ephemeral.EnvEphemeral) == "" {
+			_ = os.Setenv(ephemeral.EnvEphemeral, "1")
+		}
+	}
+
+	// Unconditional propagation: whenever auto-detection identifies a
+	// constrained environment OR the operator set OX_EPHEMERAL
+	// explicitly, ensure the canonical env var is visible to any
+	// subprocess `prime` spawns (Claude Code, sub-`ox` calls). Single
+	// write site, CQS preserved — ephemeral.Reason() stays a query.
+	if reason := ephemeral.Reason(); reason != "" && os.Getenv(ephemeral.EnvEphemeral) == "" {
+		_ = os.Setenv(ephemeral.EnvEphemeral, "1")
+	}
+
 	// gate: require agent context
 	if errMsg := agentx.RequireAgent("ox agent prime"); errMsg != "" {
 		return fmt.Errorf("%s", errMsg)
@@ -570,6 +609,14 @@ func runAgentPrime(cmd *cobra.Command, args []string) error {
 		CurrentUserAliases: currentUserAliases,
 	}
 
+	// MCP routing hint: emit the cloud MCP endpoint + suggested tools
+	// unconditionally — the cloud MCP server is a valid context source
+	// on a dev laptop too, it just isn't preferred there. The hint
+	// builder flips Active=true / Recommendation only when the runtime
+	// cannot satisfy context queries locally (no persistent disk OR no
+	// daemon). See cmd/ox/agent_prime_ephemeral_hint.go.
+	output.EphemeralHint = buildEphemeralHint(teamCtx, projectRoot)
+
 	// ADR-017: surface the binding the agent's CWD currently resolves to.
 	// Look it up in the KB list so the emitted entry carries the same
 	// type/slug/path enrichment as the matching row. Resolve from the
@@ -736,6 +783,47 @@ func runAgentPrime(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// ADR-020: surface the paused-parent subagent skip notice at the top level.
+	// startSessionRecording returns a sessionStatus with UserNotification set
+	// when a subagent's parent was paused; without this, the message lives only
+	// in the nested Session struct and the top-level prime output derives its
+	// "Session recording" hint from Session.Recording alone, so the agent ends
+	// up advertising "Session recording: available (/ox-session-start)" while
+	// the recording was just intentionally skipped. Lift the message into the
+	// canonical UserNotices channel so both --json and --text consumers see it.
+	if sessionStat != nil && !sessionStat.Recording && sessionStat.UserNotification != "" {
+		output.UserNotices = append(output.UserNotices, UserNotice{
+			Type:    "session-skipped",
+			Message: sessionStat.UserNotification,
+		})
+		if output.UserNotification == "" {
+			output.UserNotification = sessionStat.UserNotification
+		} else {
+			output.UserNotification = sessionStat.UserNotification + " " + output.UserNotification
+		}
+	}
+
+	// ADR-019: /clear is a session boundary. When this prime invocation follows
+	// a /clear that finalized a prior session, surface the transition to the
+	// user. The stopSessionForClear handoff is via OX_CLEAR_PRIOR_SESSION env.
+	if clearInfo := parseClearNoticeEnv(); clearInfo != nil {
+		recordingOn := output.Session != nil && output.Session.Recording
+		notice := renderClearNotice(clearInfo, agentID, recordingOn)
+		if notice != "" {
+			output.UserNotices = append(output.UserNotices, UserNotice{
+				Type:    "clear-boundary",
+				Message: notice,
+			})
+			// also prepend to the pre-assembled UserNotification so JSON
+			// consumers without UserNotices support still see it.
+			if output.UserNotification == "" {
+				output.UserNotification = notice
+			} else {
+				output.UserNotification = notice + " " + output.UserNotification
+			}
+		}
+	}
+
 	if hooksInstalled {
 		output.HooksRestartNotice = "SageOx hooks were just installed. Tell the user to exit this session and start a new one so the hooks take effect."
 		output.UserNotices = append(output.UserNotices, UserNotice{
@@ -819,6 +907,11 @@ func runAgentPrime(cmd *cobra.Command, args []string) error {
 	output.Timing = timing
 
 	err = outputAgentPrime(cmd, textMode, reviewMode, output)
+
+	// Emit PAT expiry warning to stderr (post-output so structured stdout is
+	// never polluted). Internally skipped in ephemeral mode and when stderr
+	// isn't a TTY — so cloud agents and JSON-only consumers never see it.
+	_ = auth.CheckAndWarnExpiry(cmd.Context(), projectEndpoint, os.Stderr)
 
 	// eagerly create whisper.db if not yet present (daemon may take time to start)
 	if projCfg, cfgErr := config.LoadProjectConfig(projectRoot); cfgErr == nil && projCfg != nil {
@@ -1042,6 +1135,31 @@ func startSessionRecording(projectRoot, agentID, agentType, parentAgentID string
 		return nil
 	}
 
+	// ADR-020: subagent inheritance. When this prime call is for a subagent
+	// (parentAgentID set) and the parent's recording is currently suspended,
+	// the subagent skips recording entirely. Subagents are atomic units of
+	// work spawned within the parent's context window; if the parent has
+	// paused, the user's intent is "no recording" for this scope.
+	if parentAgentID != "" {
+		if _, _, parentPaused := session.PeekExplicitPause(projectRoot, parentAgentID); parentPaused {
+			return &sessionStatus{
+				Recording:        false,
+				Mode:             resolved.Mode,
+				Source:           string(resolved.Source),
+				UserNotification: "[ox] Parent session suspended. Recording skipped for this subagent.",
+			}
+		}
+		// also honor an in-flight pause without marker (defensive)
+		if parentState, _ := session.LoadRecordingStateForAgent(projectRoot, parentAgentID); parentState != nil && parentState.SuspendedAt != nil {
+			return &sessionStatus{
+				Recording:        false,
+				Mode:             resolved.Mode,
+				Source:           string(resolved.Source),
+				UserNotification: "[ox] Parent session suspended. Recording skipped for this subagent.",
+			}
+		}
+	}
+
 	// check if already recording
 	if existing, err := session.LoadRecordingStateForAgent(projectRoot, agentID); err == nil && existing != nil {
 		return &sessionStatus{
@@ -1099,6 +1217,13 @@ func startSessionRecording(projectRoot, agentID, agentType, parentAgentID string
 		}
 	}
 
+	// ADR-020: per-agent pause stickiness. If a .session_paused.<agentID> marker
+	// exists for this agent (from a prior /clear or pause), the new session
+	// inherits the suspended state. We snapshot the existence here so the
+	// marker can outlive the StartRecording call; the marker itself is only
+	// cleared by explicit resume/stop/abort or daemon expiration.
+	inheritedPauseSeq, inheritedPauseAt, inheritedPause := session.PeekExplicitPause(projectRoot, agentID)
+
 	state, err := session.StartRecording(projectRoot, opts)
 	if err != nil {
 		// already recording is not an error
@@ -1121,6 +1246,46 @@ func startSessionRecording(projectRoot, agentID, agentType, parentAgentID string
 		// non-fatal but visible — agent sees stderr and can surface it
 		fmt.Fprintf(os.Stderr, "warning: session recording failed to start: %v\n", err)
 		return nil
+	}
+
+	// ADR-020: apply inherited pause state when a marker was present at start.
+	// Done before writeRawHeader so the header reflects the suspended lifecycle
+	// from entry 0. The marker survives — it is cleared only by explicit
+	// resume/stop/abort or daemon expiration.
+	if inheritedPause {
+		clearInfo := parseClearNoticeEnv()
+		priorSession := ""
+		// "inherited-from-clear" is only accurate when we actually saw a /clear
+		// handoff (OX_CLEAR_PRIOR_SESSION present); a surviving
+		// .session_paused.<agentID> marker can also come from a plain agent
+		// restart, in which case the persisted timeline should say "inherited"
+		// — not lie about the trigger.
+		reason := "inherited"
+		if clearInfo != nil {
+			priorSession = clearInfo.SessionName
+			reason = "inherited-from-clear"
+		}
+		if updateErr := session.UpdateRecordingStateForAgent(projectRoot, agentID, func(s *session.RecordingState) {
+			now := time.Now().UTC()
+			s.SuspendedAt = &now
+			s.InheritedPause = true
+			s.InheritedFromSession = priorSession
+			s.PauseCount++
+			s.Lifecycle = append(s.Lifecycle, session.LifecycleEvent{
+				Action: session.LifecycleActionPause,
+				At:     now,
+				Seq:    0,
+				Reason: reason,
+			})
+			_ = inheritedPauseAt // retained for telemetry if future fields need it
+			_ = inheritedPauseSeq
+		}); updateErr != nil {
+			slog.Warn("inherited pause: failed to update recording state", "agent_id", agentID, "error", updateErr)
+		}
+		// reload so subsequent header write reflects suspended state
+		if reloaded, _ := session.LoadRecordingStateForAgent(projectRoot, agentID); reloaded != nil {
+			state = reloaded
+		}
 	}
 
 	// write raw.jsonl header immediately so incremental hooks can append entries
@@ -1385,6 +1550,26 @@ func outputAgentPrimeText(cmd *cobra.Command, output agentPrimeOutput) error {
 			output.PrimeExcessiveNotice,
 			"",
 		)
+	}
+
+	// ADR-019/020: surface UserNotices that have no dedicated text-mode
+	// renderer. Without this, the /clear boundary notice and the paused-
+	// parent subagent-skipped notice land in output.UserNotices but
+	// outputAgentPrimeText was previously rendering only the typed boxes
+	// (HooksInstalled / SupportNotice / PrimeExcessiveNotice / upgrade),
+	// so --text mode would lose the lifecycle boundary handoff entirely.
+	// Skip notice types that are already rendered above to avoid dup.
+	renderedTypes := map[string]bool{
+		"restart": true, // HooksInstalled box already printed
+		"support": true, // SupportNotice box already printed
+		"upgrade": true, // UpdateAvailable box already printed
+	}
+	for _, n := range output.UserNotices {
+		if renderedTypes[n.Type] || n.Message == "" {
+			continue
+		}
+		fmt.Fprintln(cmd.OutOrStdout())
+		fmt.Fprintln(cmd.OutOrStdout(), n.Message)
 	}
 
 	// session status section
@@ -1700,9 +1885,40 @@ func trackPrimeTypeMismatch(inst *agentinstance.Instance, claimedType string) {
 // repoSlug is the current repo's "owner/repo" identifier (or empty if unknown).
 // It is used to filter team rules by their repos: frontmatter field — rules
 // that specify a repos: list only load when the current repo matches.
+//
+// In ephemeral mode (no daemon, no clone) this falls through to an HTTP
+// fetch of /api/v1/teams/{team_id}/context, writes the response to disk,
+// and re-runs the local discovery. See agent_prime_ephemeral_fallback.go.
 func discoverTeamContext(projectRoot, repoSlug string) *teamContextInfo {
+	return discoverTeamContextWithFallback(projectRoot, repoSlug, true)
+}
+
+// discoverTeamContextWithFallback is the real implementation. The
+// enableEphemeralFallback flag exists so the HTTP-fallback path can
+// re-invoke local-only discovery without recursing into itself.
+func discoverTeamContextWithFallback(projectRoot, repoSlug string, enableEphemeralFallback bool) *teamContextInfo {
 	if projectRoot == "" {
 		return nil
+	}
+
+	// In non-persistent environments, refresh team context over HTTP on every
+	// prime. These environments do not keep a durable clone warm, so a successful
+	// prior fetch should not turn the fallback into a one-shot stale cache.
+	//
+	// IMPORTANT: gate on PersistDisk, not the broader IsEphemeral() composite.
+	// CI runners and OX_NO_DAEMON sandboxes still have durable local state; they
+	// should read the existing clone/path directly instead of rewriting it over
+	// HTTP on every prime.
+	if enableEphemeralFallback && !runtime.Caps().PersistDisk {
+		if pc, err := config.LoadProjectConfig(projectRoot); err == nil && pc != nil && pc.TeamID != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if info, ferr := tryHTTPTeamContextFallback(ctx, projectRoot, pc.TeamID); ferr == nil && info != nil {
+				return info
+			} else if ferr != nil {
+				slog.Debug("ephemeral team-context fallback failed", "team_id", pc.TeamID, "err", ferr)
+			}
+		}
 	}
 
 	tc := config.FindRepoTeamContext(projectRoot)

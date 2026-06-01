@@ -292,6 +292,29 @@ Default: "Co-Authored-By: [SageOx](https://github.com/SageOx)"`,
 		Levels:      []ConfigLevel{ConfigLevelUser, ConfigLevelRepo},
 	},
 	{
+		Key:         "hooks.userpromptsubmit.cloud_query",
+		Description: "Allow UserPromptSubmit to also query SageOx cloud",
+		LongDescription: `Controls whether the UserPromptSubmit hook may issue a remote SageOx
+query IN ADDITION to the always-on local query.
+
+  off - Default. Zero network calls happen on the prompt path, regardless
+        of any other setting. Local-ledger query only.
+  on  - Run the local query AND a parallel cloud query (when authenticated).
+        Cloud results are tagged '[ox-recall:remote]' so the source is
+        visible. If 'ox login' has not run, this silently degrades to
+        local-only — the prompt never errors.
+
+Tradeoff: enabling improves recall (the server-side index sees more than
+the local cached ledger), at the cost of sending REDACTED prompt text to
+the configured SageOx endpoint. Prompt content always passes through the
+secrets-redaction pipeline before any byte leaves the machine —
+redaction is non-negotiable, not a separate toggle.`,
+		Category:    "Privacy",
+		ValidValues: []string{"on", "off"},
+		Default:     "off",
+		Levels:      []ConfigLevel{ConfigLevelUser, ConfigLevelRepo},
+	},
+	{
 		Key:         "attribution.score_threshold",
 		Description: "Minimum SageOx contribution score for commit attribution",
 		LongDescription: `Controls the threshold at which SageOx earns commit attribution.
@@ -311,6 +334,14 @@ Default: 0.5`,
 		Default:     "0.5",
 		Levels:      []ConfigLevel{ConfigLevelUser, ConfigLevelRepo},
 	},
+}
+
+// boolToOnOff renders a bool as "on"/"off" for config display.
+func boolToOnOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
 }
 
 // GetSetting returns the setting definition for a key.
@@ -490,6 +521,14 @@ func ResolveConfigValue(key string, projectRoot string) (*ConfigValue, error) {
 		}
 		if repoCfg != nil && repoCfg.Attribution != nil && repoCfg.Attribution.IsScoreThresholdSet() {
 			cv.RepoVal = strconv.FormatFloat(repoCfg.Attribution.GetScoreThreshold(), 'f', -1, 64)
+		}
+
+	case "hooks.userpromptsubmit.cloud_query":
+		if userCfg != nil && userCfg.Hooks != nil && userCfg.Hooks.UserPromptSubmit != nil && userCfg.Hooks.UserPromptSubmit.CloudQuery != nil {
+			cv.UserVal = boolToOnOff(*userCfg.Hooks.UserPromptSubmit.CloudQuery)
+		}
+		if repoCfg != nil && repoCfg.Hooks != nil && repoCfg.Hooks.UserPromptSubmit != nil && repoCfg.Hooks.UserPromptSubmit.CloudQuery != nil {
+			cv.RepoVal = boolToOnOff(*repoCfg.Hooks.UserPromptSubmit.CloudQuery)
 		}
 
 	}
@@ -684,6 +723,12 @@ func setUserConfig(key, value string) error {
 		f, _ := strconv.ParseFloat(value, 64) // already validated
 		cfg.Attribution.ScoreThreshold = config.Float64Ptr(f)
 
+	case "hooks.userpromptsubmit.cloud_query":
+		if cfg.Hooks == nil {
+			cfg.Hooks = &config.HooksConfig{}
+		}
+		cfg.Hooks.SetUserPromptSubmitCloudQuery(value == "on")
+
 	default:
 		return fmt.Errorf("unknown user setting: %s", key)
 	}
@@ -740,6 +785,12 @@ func setRepoConfig(key, value, projectRoot string) error {
 		}
 		f, _ := strconv.ParseFloat(value, 64) // already validated
 		cfg.Attribution.ScoreThreshold = config.Float64Ptr(f)
+
+	case "hooks.userpromptsubmit.cloud_query":
+		if cfg.Hooks == nil {
+			cfg.Hooks = &config.HooksConfig{}
+		}
+		cfg.Hooks.SetUserPromptSubmitCloudQuery(value == "on")
 
 	default:
 		return fmt.Errorf("setting %s not supported at repo level", key)
@@ -858,6 +909,17 @@ func unsetUserConfig(key string) error {
 			}
 		}
 
+	case "hooks.userpromptsubmit.cloud_query":
+		if cfg.Hooks != nil && cfg.Hooks.UserPromptSubmit != nil {
+			cfg.Hooks.UserPromptSubmit.CloudQuery = nil
+			if cfg.Hooks.UserPromptSubmit.CloudQuery == nil {
+				cfg.Hooks.UserPromptSubmit = nil
+			}
+			if cfg.Hooks.UserPromptSubmit == nil {
+				cfg.Hooks = nil
+			}
+		}
+
 	default:
 		return fmt.Errorf("unknown user setting: %s", key)
 	}
@@ -909,6 +971,17 @@ func unsetRepoConfig(key, projectRoot string) error {
 			cfg.Attribution.ScoreThreshold = nil
 			if !cfg.Attribution.IsPlanSet() && !cfg.Attribution.IsCommitSet() && !cfg.Attribution.IsPRSet() && !cfg.Attribution.IsSessionSet() {
 				cfg.Attribution = nil
+			}
+		}
+
+	case "hooks.userpromptsubmit.cloud_query":
+		if cfg.Hooks != nil && cfg.Hooks.UserPromptSubmit != nil {
+			cfg.Hooks.UserPromptSubmit.CloudQuery = nil
+			if cfg.Hooks.UserPromptSubmit.CloudQuery == nil {
+				cfg.Hooks.UserPromptSubmit = nil
+			}
+			if cfg.Hooks.UserPromptSubmit == nil {
+				cfg.Hooks = nil
 			}
 		}
 

@@ -6,7 +6,29 @@ import (
 	"os"
 	"regexp"
 	"strings"
+
+	"github.com/sageox/ox/internal/config"
 )
+
+// userPromptSubmitHookHelp is the canonical help string the upcoming
+// `--check=hooks` line will surface for the UserPromptSubmit JIT discovery
+// hook (epic ox-r9mq, wired by ox-8wmo). Defined here so the doctor help
+// text and the future check share a single source of truth — the actual
+// check registration lands in ox-8wmo and reads this constant.
+//
+// Surfaced fields when the check runs:
+//   - whether the UserPromptSubmit hook is installed in .claude/settings.json
+//   - effective value of hooks.userpromptsubmit.cloud_query (local-only vs
+//     cloud-enabled) with the privacy/latency tradeoff line
+//   - effective timeout and length-gate values when non-default
+//   - whether the local query index is reachable
+//
+// See docs/ai/specs/userpromptsubmit-jit-discovery.md for the full contract.
+const userPromptSubmitHookHelp = "UserPromptSubmit JIT discovery: " +
+	"checks hook installation, hooks.userpromptsubmit.cloud_query " +
+	"(default local-only — prompts never leave this machine), timeout " +
+	"and length-gate config, and local query index reachability. " +
+	"Disable: ox config set hooks.userpromptsubmit.enabled false."
 
 func init() {
 	RegisterDoctorCheck(&DoctorCheck{
@@ -19,6 +41,32 @@ func init() {
 			return checkProjectHookCompleteness(fix)
 		},
 	})
+
+	RegisterDoctorCheck(&DoctorCheck{
+		Slug:        CheckSlugCloudQueryConfig,
+		Name:        "UserPromptSubmit cloud query",
+		Category:    "Integration",
+		FixLevel:    FixLevelCheckOnly,
+		Description: "Reports the effective cloud_query opt-in and the privacy/recall tradeoff",
+		Run: func(_ bool) checkResult {
+			return checkUserPromptSubmitCloudQuery()
+		},
+	})
+}
+
+// checkUserPromptSubmitCloudQuery reports the effective value of
+// hooks.userpromptsubmit.cloud_query and the one-line tradeoff explanation.
+// This is informational only (FixLevelCheckOnly) — there is no broken
+// state to repair; the user explicitly chose the value.
+func checkUserPromptSubmitCloudQuery() checkResult {
+	gitRoot := findGitRoot()
+	enabled := config.ResolveUserPromptSubmitCloudQuery(gitRoot)
+	if enabled {
+		return PassedCheck("UserPromptSubmit cloud query",
+			"on — prompts also queried against SageOx cloud (redacted); higher recall, less privacy")
+	}
+	return PassedCheck("UserPromptSubmit cloud query",
+		"off — local-ledger only, zero network calls on prompt path; strictest privacy, lower recall")
 }
 
 // checkSessionStartHookBug warns about Claude Code bug #10373 where SessionStart

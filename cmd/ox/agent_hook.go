@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -70,6 +71,10 @@ type HookContext struct {
 	Input       *agentx.HookInput // parsed stdin JSON
 	Marker      *SessionMarker    // nil if not yet primed
 	ProjectRoot string            // git root with .sageox/
+
+	// ClearNotice carries finalized-prior-session info from stopSessionForClear
+	// to the prime subprocess so prime can emit a user-facing notice. See ADR-019.
+	ClearNotice *ClearNoticeInfo
 }
 
 // runAgentHook is the entry point for `ox agent hook <event>`.
@@ -298,11 +303,19 @@ func handleStart(ctx *HookContext) error {
 // This finalizes the old session so it gets uploaded, then prime starts a fresh one.
 // Sets StoppedAt, sends fire-and-forget IPC finalization to the daemon, and clears
 // recording state so prime can start a fresh session.
+//
+// As a side effect, populates ctx.ClearNotice with finalized-session info so the
+// downstream prime subprocess can render a user-facing notice describing the
+// boundary transition (see ADR-019).
 func stopSessionForClear(ctx *HookContext, agentID string) {
 	state, err := session.LoadRecordingStateForAgent(ctx.ProjectRoot, agentID)
 	if err != nil || state == nil {
 		return // not recording, nothing to stop
 	}
+
+	// capture finalized-session info for the post-clear notice (ADR-019).
+	// done before we mutate state so SessionPath is still accurate.
+	ctx.ClearNotice = buildClearNoticeFromState(state)
 
 	// set StoppedAt to signal this session is complete
 	now := time.Now()
@@ -438,6 +451,34 @@ func handleEnd(ctx *HookContext) error {
 // whispers are delivered exactly once across all channels. If handlePrompt delivers
 // a whisper, the PostToolUse fallback and active pull get 0 entries — no duplication.
 func handlePrompt(ctx *HookContext) error {
+	// Local-recall preamble runs BEFORE whispers so the model sees prior
+	// ledger context first. Strictly additive: any failure / timeout /
+	// no-match leaves the existing whisper path completely untouched.
+	if ctx.Input != nil {
+		if prompt := extractPromptText(ctx.Input.RawBytes); prompt != "" {
+			emitLocalRecallPreamble(os.Stdout, prompt)
+
+			// Cloud-query gate (opt-in only; default off). Wired here so the
+			// policy + redaction layer is exercised on every prompt — even
+			// though the cloud-side runner that consumes the decision is a
+			// follow-up (epic ox-r9mq). Today this is a no-op on the default
+			// config; under opt-in it logs the decision and produces the
+			// redacted prompt the future runner will transmit. Keeping the
+			// gate hot means a future runner cannot accidentally skip the
+			// redaction step — the only way to get a transmittable prompt
+			// is through PrepareCloudQuery.
+			cqCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			decision := PrepareCloudQuery(cqCtx, ctx.ProjectRoot, prompt)
+			cancel()
+			if decision.ShouldQuery {
+				slog.Info("hook: cloud-query gate open", "redacted_tokens", decision.RedactedTokens)
+				// cloud runner dispatch lives in a follow-up; until it lands
+				// the decision is computed (and tested) but no bytes leave
+				// the machine.
+			}
+		}
+	}
+
 	agentID := ""
 	if ctx.Marker != nil {
 		agentID = ctx.Marker.AgentID
@@ -445,8 +486,30 @@ func handlePrompt(ctx *HookContext) error {
 	if agentID == "" {
 		return nil
 	}
+
+	// ADR-020: emit a per-prompt nudge while the session is suspended. This
+	// fires on every UserPromptSubmit so the user cannot silently forget that
+	// recording is paused. Scoped to the current agent's suspended session
+	// only — other agents' paused sessions in this repo do not bleed into
+	// this terminal's nudge.
+	emitSuspendedNudge(os.Stdout, ctx.ProjectRoot, agentID)
+
 	emitWhispers(os.Stdout, agentID)
 	return nil
+}
+
+// emitSuspendedNudge writes a single-line system reminder to stdout when
+// the current agent's recording is suspended. No-op when not suspended.
+func emitSuspendedNudge(w io.Writer, projectRoot, agentID string) {
+	if projectRoot == "" || agentID == "" {
+		return
+	}
+	state, err := session.LoadRecordingStateForAgent(projectRoot, agentID)
+	if err != nil || state == nil || state.SuspendedAt == nil {
+		return
+	}
+	dur := formatPausedDuration(time.Since(*state.SuspendedAt))
+	fmt.Fprintf(w, "<system-reminder>[ox] ⏸ Recording SUSPENDED (%s ago). Resume: /ox-session-resume · Stop: /ox-session-stop</system-reminder>\n", dur)
 }
 
 // handleCompact handles the compact phase.
@@ -731,6 +794,9 @@ func runPrimeForHook(agentID string, ctx *HookContext) error {
 
 	cmd := exec.Command(oxPath, args...)
 	env := buildPrimeEnv(agentID)
+	if pair := serializeClearNoticeEnv(ctx.ClearNotice); pair != "" {
+		env = append(env, pair)
+	}
 	cmd.Env = env
 	// pass original raw bytes to preserve unknown fields (not re-serialized)
 	if ctx.Input != nil && len(ctx.Input.RawBytes) > 0 {

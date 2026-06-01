@@ -20,9 +20,11 @@ import (
 	"github.com/sageox/ox/internal/doctor/checks"
 	"github.com/sageox/ox/internal/endpoint"
 	"github.com/sageox/ox/internal/gitutil"
+	"github.com/sageox/ox/internal/perf"
 	"github.com/sageox/ox/internal/tips"
 	"github.com/sageox/ox/internal/ui"
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // checkResult represents a single diagnostic check
@@ -328,7 +330,7 @@ common issues, or --fix-slug to target specific checks.`,
 			renderDoctorHeader(cmd.OutOrStdout(), opts.fix)
 		}
 
-		categories := runDoctorChecks(opts)
+		categories := runDoctorChecks(cmd.Context(), opts)
 		hasFailed := displayDoctorResults(cmd, categories, opts)
 
 		// record doctor run timestamp for staleness tracking
@@ -354,6 +356,12 @@ common issues, or --fix-slug to target specific checks.`,
 		tips.MaybeShow("doctor", tips.RandomChance, cfg.Quiet, !userCfg.AreTipsEnabled(), cfg.JSON)
 
 		cli.PrintDisclaimer()
+
+		// trailing PAT expiry warning — single-line stderr, suppressed in
+		// ephemeral mode and when stderr isn't a TTY. Doctor is the right
+		// surface: users run it when something feels off, and a near-expired
+		// PAT is exactly the class of thing they'd want surfaced.
+		_ = auth.CheckAndWarnExpiry(cmd.Context(), projectEndpoint, os.Stderr)
 
 		if hasFailed && (cfg == nil || !cfg.JSON) {
 			return fmt.Errorf("some checks failed")
@@ -529,18 +537,27 @@ func detectDoctorState() doctorState {
 
 // doctorProgress shows per-category progress during doctor checks.
 // Displays timing for each category so users can see what's slow.
+//
+// Each show() call also opens a perf span scoped to the category. The
+// span is closed automatically when the next category begins (or when
+// clear() runs in defer). This means `OX_TRACE=1 ox doctor` renders a
+// tree showing exactly which category dominated the run.
 type doctorProgress struct {
 	interactive bool
 	verbose     bool
 	lastStart   time.Time
 	lastName    string
 	lineCount   int
+
+	ctx         context.Context
+	currentSpan trace.Span
 }
 
 func newDoctorProgress(verbose bool) *doctorProgress {
 	return &doctorProgress{
 		interactive: cli.IsInteractive(),
 		verbose:     verbose,
+		ctx:         context.Background(),
 	}
 }
 
@@ -548,6 +565,15 @@ func newDoctorProgress(verbose bool) *doctorProgress {
 // In verbose mode: prints timing for previous category on its own line.
 // In non-verbose mode: overwrites the progress line in-place.
 func (p *doctorProgress) show(category string) {
+	// close the previous category's span (perf tree); always runs even
+	// when the user is non-interactive so the span tree is still built
+	// for OX_TRACE=1 in CI / pipes.
+	if p.currentSpan != nil {
+		p.currentSpan.End()
+		p.currentSpan = nil
+	}
+	_, p.currentSpan = perf.Start(p.ctx, "doctor:"+category)
+
 	if !p.interactive {
 		return
 	}
@@ -567,6 +593,11 @@ func (p *doctorProgress) show(category string) {
 
 // clear removes the ephemeral status line and logs final timing
 func (p *doctorProgress) clear() {
+	if p.currentSpan != nil {
+		p.currentSpan.End()
+		p.currentSpan = nil
+	}
+
 	if !p.interactive {
 		return
 	}
@@ -581,11 +612,21 @@ func (p *doctorProgress) clear() {
 	fmt.Fprint(os.Stderr, "\r\033[K")
 }
 
-func runDoctorChecks(opts doctorOptions) []checkCategory {
+func runDoctorChecks(parent context.Context, opts doctorOptions) []checkCategory {
 	var categories []checkCategory
-	ctx := context.Background()
+	if parent == nil {
+		parent = context.Background()
+	}
+
+	// Open a parent span so per-category spans nest under "doctor".
+	// We inherit from the command's context so this span attaches to
+	// the existing CLI root span — the tree renders once at command
+	// end rather than fragmenting mid-output.
+	ctx, rootSpan := perf.Start(parent, "doctor")
+	defer rootSpan.End()
 
 	progress := newDoctorProgress(opts.verbose)
+	progress.ctx = ctx
 	defer progress.clear()
 
 	// detect environment state early for conditional suppression
@@ -814,6 +855,7 @@ func runDoctorChecks(opts doctorOptions) []checkCategory {
 			opts.shouldFix(CheckSlugLedgerCleanWorkdir),
 			opts.shouldFix(CheckSlugLedgerEmbeddedCreds),
 			opts.shouldFix(CheckSlugLedgerURLAPIMatch),
+			opts.shouldFix(CheckSlugLedgerUnmergedPaths),
 			opts.shouldFix(CheckSlugGitHubDataMigration),
 		)
 		if len(ledgerGitChecks) > 0 {
@@ -889,12 +931,24 @@ func runDoctorChecks(opts doctorOptions) []checkCategory {
 		}
 	}
 
+	// Category 9b: Ephemeral Mode (own category, NOT merged into Daemon).
+	// Surfacing this as a sibling category — rather than appending it to
+	// Daemon — keeps the Daemon category's "single grouped skip" invariant
+	// intact (see TestDoctorSuppression_DaemonNotRunning) while still
+	// making the predicate visible. Ephemeral mode is the most common
+	// explanation for an absent daemon, but it deserves its own grouping.
+	// See docs/ai/adr/adr-ephemeral-mode.md.
+	progress.show("Ephemeral Mode")
+	categories = append(categories, checkCategory{
+		name:   "Ephemeral Mode",
+		checks: []checkResult{checkEphemeralMode()},
+	})
+
 	// Category 10: Daemon
 	progress.show("Daemon")
 	if state.isDaemonRunning {
 		daemonChecks := checkDaemonHealth(opts)
 		if state.isBootstrapping && len(daemonChecks) > 0 {
-			// prepend bootstrap info banner
 			bootstrapBanner := InfoCheck("daemon bootstrap",
 				"initial sync in progress",
 				"Run `ox doctor` again in a minute")
@@ -1078,8 +1132,9 @@ func enrichCheckResult(check *checkResult) {
 //   - fixWorkdir: whether to auto-commit dirty workdir
 //   - fixEmbeddedCreds: whether to strip embedded oauth2:TOKEN from origin URL
 //   - fixURLAPIMatch: whether to repoint origin URL to the API-authoritative URL
+//   - fixUnmergedPaths: whether to auto-abort a stuck merge/rebase that left U-state files
 //   - fixMigration: whether to migrate legacy GitHub data files
-func checkLedgerGitHealth(networkChecks bool, fixGitignore bool, fixBranch bool, fixWorkdir bool, fixEmbeddedCreds bool, fixURLAPIMatch bool, fixMigration ...bool) []checkResult {
+func checkLedgerGitHealth(networkChecks bool, fixGitignore bool, fixBranch bool, fixWorkdir bool, fixEmbeddedCreds bool, fixURLAPIMatch bool, fixUnmergedPaths bool, fixMigration ...bool) []checkResult {
 	ledgerPath := getLedgerPath()
 	if ledgerPath == "" {
 		return nil // no ledger found, skip entire category
@@ -1097,6 +1152,11 @@ func checkLedgerGitHealth(networkChecks bool, fixGitignore bool, fixBranch bool,
 		checks = append(checks, SkippedCheck("Ledger remote connectivity", "use --fix for network checks", ""))
 	}
 	checks = append(checks,
+		// ox-8zd3: unmerged paths must surface BEFORE clean-workdir. A stuck
+		// merge/rebase/cherry-pick silently blocks every future commit on the
+		// ledger; the previous order let the wedge hide inside the dirty-workdir
+		// counter ("3 modified") instead of producing an actionable P0.
+		checkLedgerUnmergedPaths(fixUnmergedPaths),
 		checkLedgerCleanWorkdir(fixWorkdir),
 		checkLedgerBranchStatus(fixBranch),
 		// ox-eeqi: post-migration the PAT lives in the credential helper,

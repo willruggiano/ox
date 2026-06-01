@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"time"
 
 	lipgloss "charm.land/lipgloss/v2"
 	"github.com/sageox/ox/internal/cli"
+	"github.com/sageox/ox/internal/lfs"
 	"github.com/sageox/ox/internal/session"
 	"github.com/spf13/cobra"
 )
@@ -59,12 +61,16 @@ type sessionShowData struct {
 
 // sessionMetadata contains session header metadata
 type sessionMetadata struct {
-	Version   string
-	AgentID   string
-	AgentType string
-	Username  string
-	RepoID    string
-	CreatedAt time.Time
+	Version         string
+	AgentID         string
+	AgentType       string
+	Username        string
+	RepoID          string
+	CreatedAt       time.Time
+	ProducedCommits []string `json:",omitempty"`
+	LinkedPRs       []string `json:",omitempty"`
+	LinkedIssues    []string `json:",omitempty"`
+	LinkageStatus   string   `json:",omitempty"`
 }
 
 var sessionShowCmd = &cobra.Command{
@@ -159,6 +165,22 @@ func viewAsJSON(w io.Writer, storedSession *session.StoredSession, metadataOnly 
 	return showRawSession(w, t, limit)
 }
 
+// readSessionMetaForView loads the full SessionMeta for the session whose
+// raw.jsonl lives at jsonlPath. Returns nil on any error — linkage fields
+// are purely informational and a read failure must not break view
+// rendering. Callers pick whichever fields they render.
+func readSessionMetaForView(jsonlPath string) *lfs.SessionMeta {
+	if jsonlPath == "" {
+		return nil
+	}
+	sessionDir := filepath.Dir(jsonlPath)
+	meta, err := lfs.ReadSessionMeta(sessionDir)
+	if err != nil || meta == nil {
+		return nil
+	}
+	return meta
+}
+
 // convertStoredSession converts a session.StoredSession to sessionShowData.
 func convertStoredSession(st *session.StoredSession) *sessionShowData {
 	t := &sessionShowData{
@@ -168,7 +190,7 @@ func convertStoredSession(st *session.StoredSession) *sessionShowData {
 	}
 
 	if st.Meta != nil {
-		t.Metadata = &sessionMetadata{
+		md := &sessionMetadata{
 			Version:   st.Meta.Version,
 			AgentID:   st.Meta.AgentID,
 			AgentType: st.Meta.AgentType,
@@ -176,6 +198,16 @@ func convertStoredSession(st *session.StoredSession) *sessionShowData {
 			RepoID:    st.Meta.RepoID,
 			CreatedAt: st.Meta.CreatedAt,
 		}
+		// linkage fields live in the full lfs.SessionMeta (meta.json), not in
+		// the lighter session.StoreMeta carried by StoredSession. Read them
+		// from disk; best-effort, nil-safe.
+		if full := readSessionMetaForView(st.Info.FilePath); full != nil {
+			md.ProducedCommits = full.ProducedCommits
+			md.LinkedPRs = full.LinkedPRs
+			md.LinkedIssues = full.LinkedIssues
+			md.LinkageStatus = full.LinkageStatus
+		}
+		t.Metadata = md
 	}
 
 	return t

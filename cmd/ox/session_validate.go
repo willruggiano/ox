@@ -56,6 +56,36 @@ var invalidLeakedTypes = map[string]bool{
 	"last-prompt":           true,
 }
 
+// validateMaskInvariant verifies that ApplySegmentMask correctly removed
+// every entry that should have been excluded by the lifecycle timeline.
+//
+// Called by processSession AFTER mask application. Returns an error string
+// if the post-mask count doesn't match what CountMaskedEntries computed
+// against the pre-mask slice — that mismatch indicates the mask was
+// bypassed or malformed and paused work would otherwise leak to upload.
+//
+// See ADR-020 client-side validator.
+func validateMaskInvariant(originalCount, postMaskCount int, lifecycle []session.LifecycleEvent) string {
+	if len(lifecycle) == 0 {
+		if originalCount != postMaskCount {
+			return fmt.Sprintf("mask invariant: no lifecycle events but %d entries dropped", originalCount-postMaskCount)
+		}
+		return ""
+	}
+
+	// Compute how many entries SHOULD be excluded directly from the count —
+	// avoid allocating `originalCount` SessionEntry values just to drive a
+	// counting loop. Sessions on the upload path can be tens of thousands
+	// of entries; the allocation is pure GC pressure.
+	expectedMasked := session.CountMaskedEntriesByTotal(originalCount, lifecycle)
+	actualMasked := originalCount - postMaskCount
+
+	if expectedMasked != actualMasked {
+		return fmt.Sprintf("mask invariant: lifecycle expects %d masked entries but %d were dropped (paused range may leak to upload)", expectedMasked, actualMasked)
+	}
+	return ""
+}
+
 // validateEntries checks processed session entries for data quality issues.
 // Runs after the adapter has converted raw entries but before upload.
 func validateEntries(entries []session.Entry) *sessionValidation {

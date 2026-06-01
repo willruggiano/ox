@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -24,22 +25,71 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+// TokenFunc returns the current bearer token to attach to OTLP requests.
+// Called per-export so long-running processes (daemon) pick up rotated tokens.
+// Returning "" sends the request unauthenticated — the server JWT-gate will
+// then 401 and the batch is dropped, which is the correct behavior when the
+// user is logged out.
+type TokenFunc func() string
+
+type bearerRoundTripper struct {
+	base      http.RoundTripper
+	tokenFunc TokenFunc
+}
+
+func (rt *bearerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if tok := rt.tokenFunc(); tok != "" {
+		// clone to avoid mutating the caller's request (otlptracehttp may retry)
+		req = req.Clone(req.Context())
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	return rt.base.RoundTrip(req)
+}
+
 var (
-	mu       sync.RWMutex
-	rootCtx  context.Context
-	rootSpan trace.Span
-	tracer   trace.Tracer
-	shutFn   func(context.Context) error
+	mu              sync.RWMutex
+	rootCtx         context.Context
+	rootSpan        trace.Span
+	tracer          trace.Tracer
+	shutFn          func(context.Context) error
+	extraProcessors []sdktrace.SpanProcessor
 )
+
+// AddSpanProcessor registers an additional SpanProcessor to be installed
+// alongside the OTLP batch exporter on the next Init() call. Must be
+// called BEFORE Init — processors added after Init are ignored, because
+// the TracerProvider is already built.
+//
+// Used by callers (CLI bootstrap, daemon bootstrap) to wire in
+// internal/perf's TreeCollectorProcessor so per-phase timing renders
+// locally in addition to flowing to the OTLP backend.
+//
+// Safe to call multiple times; each processor is registered once.
+func AddSpanProcessor(p sdktrace.SpanProcessor) {
+	if p == nil {
+		return
+	}
+	mu.Lock()
+	extraProcessors = append(extraProcessors, p)
+	mu.Unlock()
+}
 
 // Init sets up the OTel TracerProvider with OTLP/HTTP export to the SageOx
 // OTLP proxy at {apiEndpoint}/api/v1/otlp/v1/traces.
 //
+// The proxy is JWT-gated (see apps/api-go/internal/handlers/otlp_proxy.go),
+// so tokenFunc is required for exports to succeed. tokenFunc is invoked
+// per-request rather than baked into a static header so long-running
+// processes (the daemon) pick up rotated tokens without restart.
+//
 // Extra attrs are merged into the OTel resource alongside service.name.
 // The daemon uses this to set client.id, client.class, os.type, etc.
 //
-// Safe to call with empty apiEndpoint — tracing is disabled (noop).
-func Init(ctx context.Context, serviceName, apiEndpoint string, attrs ...attribute.KeyValue) error {
+// Safe to call with empty apiEndpoint or nil tokenFunc — tracing is
+// disabled (noop) or sends unauthenticated (server will 401, batch
+// dropped silently). Either is fine for tests and for users who are
+// logged out.
+func Init(ctx context.Context, serviceName, apiEndpoint string, tokenFunc TokenFunc, attrs ...attribute.KeyValue) error {
 	if apiEndpoint == "" {
 		slog.Debug("otel tracing disabled", "reason", "no endpoint")
 		return nil
@@ -59,6 +109,12 @@ func Init(ctx context.Context, serviceName, apiEndpoint string, attrs ...attribu
 	if parsed.Scheme == "http" {
 		opts = append(opts, otlptracehttp.WithInsecure())
 	}
+	if tokenFunc != nil {
+		opts = append(opts, otlptracehttp.WithHTTPClient(&http.Client{
+			Timeout:   2 * time.Second,
+			Transport: &bearerRoundTripper{base: http.DefaultTransport, tokenFunc: tokenFunc},
+		}))
+	}
 
 	exporter, err := otlptracehttp.New(ctx, opts...)
 	if err != nil {
@@ -68,7 +124,7 @@ func Init(ctx context.Context, serviceName, apiEndpoint string, attrs ...attribu
 	resAttrs := []attribute.KeyValue{semconv.ServiceName(serviceName)}
 	resAttrs = append(resAttrs, attrs...)
 
-	tp := sdktrace.NewTracerProvider(
+	tpOpts := []sdktrace.TracerProviderOption{
 		sdktrace.WithBatcher(exporter,
 			sdktrace.WithBatchTimeout(1*time.Second),
 			sdktrace.WithMaxExportBatchSize(16),
@@ -77,7 +133,18 @@ func Init(ctx context.Context, serviceName, apiEndpoint string, attrs ...attribu
 			semconv.SchemaURL,
 			resAttrs...,
 		)),
-	)
+	}
+	// Append any processors registered via AddSpanProcessor before Init.
+	// internal/perf uses this hook to install its TreeCollectorProcessor
+	// so the local tree renderer sees the same spans the OTLP exporter
+	// receives, without duplicate instrumentation.
+	mu.RLock()
+	for _, p := range extraProcessors {
+		tpOpts = append(tpOpts, sdktrace.WithSpanProcessor(p))
+	}
+	mu.RUnlock()
+
+	tp := sdktrace.NewTracerProvider(tpOpts...)
 	otel.SetTracerProvider(tp)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 

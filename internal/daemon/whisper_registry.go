@@ -16,11 +16,18 @@ import (
 // The daemon creates one WhisperRegistry at startup. It wraps:
 //   - One ledger whisper store (single-writer, owned by this daemon)
 //   - Zero or more team whisper stores (shared across daemons via WAL)
+//
+// Team stores are tracked with a last-access timestamp so an idle-close
+// janitor can release their SQLite file descriptors. Whisper reads/writes
+// happen on the order of minutes, so holding every team DB open between
+// operations would leak ~3 FDs per team for no benefit.
 type WhisperRegistry struct {
 	ledgerStore *whisperstore.Store
 	teamStores  map[string]*whisperstore.Store // teamID -> store
+	lastAccess  map[string]time.Time           // teamID -> last touch (open/read/write)
 	mu          sync.RWMutex
 	logger      *slog.Logger
+	now         func() time.Time // injectable clock for tests
 }
 
 // NewWhisperRegistry creates a new registry with the given ledger store.
@@ -32,8 +39,20 @@ func NewWhisperRegistry(ledgerStore *whisperstore.Store, logger *slog.Logger) *W
 	return &WhisperRegistry{
 		ledgerStore: ledgerStore,
 		teamStores:  make(map[string]*whisperstore.Store),
+		lastAccess:  make(map[string]time.Time),
 		logger:      logger,
+		now:         time.Now,
 	}
+}
+
+// SetClock overrides the clock used for idle-close tracking. Test-only.
+func (r *WhisperRegistry) SetClock(now func() time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if now == nil {
+		now = time.Now
+	}
+	r.now = now
 }
 
 // AddTeamStore registers a team whisper store.
@@ -41,6 +60,29 @@ func (r *WhisperRegistry) AddTeamStore(teamID string, store *whisperstore.Store)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.teamStores[teamID] = store
+	r.lastAccess[teamID] = r.now()
+}
+
+// touchTeamLocked bumps the last-access timestamp for a team store.
+//
+// Caller MUST hold r.mu.Lock() (write lock). RLock is not sufficient —
+// this is a Go map write, which requires mutual exclusion against any
+// concurrent map access. All current callers (Add for the "team" scope,
+// GetWhispers, GetWhispersPage) hold the write lock for the full
+// iteration; do not weaken that contract.
+func (r *WhisperRegistry) touchTeamLocked(teamID string) {
+	r.lastAccess[teamID] = r.now()
+}
+
+// TeamIDs returns the set of team IDs with currently-open stores.
+func (r *WhisperRegistry) TeamIDs() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ids := make([]string, 0, len(r.teamStores))
+	for id := range r.teamStores {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // HasTeamStore returns true if a team whisper store is already registered.
@@ -69,12 +111,14 @@ func (r *WhisperRegistry) Add(scope string, entries ...whisperstore.WhisperEntry
 		return ledger.Add(entries...)
 	case "team":
 		// team entries go to all team stores (each daemon manages its own view)
-		r.mu.RLock()
-		defer r.mu.RUnlock()
+		r.mu.Lock()
+		defer r.mu.Unlock()
 		for teamID, store := range r.teamStores {
 			if err := store.Add(entries...); err != nil {
 				r.logger.Warn("failed to add to team store", "team_id", teamID, "err", err)
+				continue
 			}
+			r.touchTeamLocked(teamID)
 		}
 		return nil
 	default:
@@ -84,15 +128,14 @@ func (r *WhisperRegistry) Add(scope string, entries ...whisperstore.WhisperEntry
 
 // GetWhispers queries ALL stores and merges results, sorted by importance then time.
 func (r *WhisperRegistry) GetWhispers(agentID string, attention whisperstore.Attention, topics []string) ([]whisperstore.WhisperEntry, error) {
-	// snapshot both stores under one RLock — ReopenLedgerStore holds a write lock
-	// while replacing r.ledgerStore, so it must be read under the mutex too.
-	r.mu.RLock()
+	// snapshot both stores under one write lock — ReopenLedgerStore holds a write lock
+	// while replacing r.ledgerStore, and we bump lastAccess for touched team stores.
+	r.mu.Lock()
 	ledger := r.ledgerStore
 	stores := make(map[string]*whisperstore.Store, len(r.teamStores))
 	for k, v := range r.teamStores {
 		stores[k] = v
 	}
-	r.mu.RUnlock()
 
 	var all []whisperstore.WhisperEntry
 
@@ -111,8 +154,10 @@ func (r *WhisperRegistry) GetWhispers(agentID string, attention whisperstore.Att
 			r.logger.Warn("team whisper query failed", "team_id", teamID, "err", err)
 			continue
 		}
+		r.touchTeamLocked(teamID)
 		all = append(all, entries...)
 	}
+	r.mu.Unlock()
 
 	if all == nil {
 		all = []whisperstore.WhisperEntry{}
@@ -142,13 +187,12 @@ func (r *WhisperRegistry) GetWhispersPage(agentID string, before time.Time, limi
 		limit = maxLimit
 	}
 
-	r.mu.RLock()
+	r.mu.Lock()
 	ledger := r.ledgerStore
 	stores := make(map[string]*whisperstore.Store, len(r.teamStores))
 	for k, v := range r.teamStores {
 		stores[k] = v
 	}
-	r.mu.RUnlock()
 
 	var all []whisperstore.WhisperEntry
 
@@ -168,8 +212,10 @@ func (r *WhisperRegistry) GetWhispersPage(agentID string, before time.Time, limi
 			r.logger.Warn("team whisper history query failed", "team_id", teamID, "err", err)
 			continue
 		}
+		r.touchTeamLocked(teamID)
 		all = append(all, entries...)
 	}
+	r.mu.Unlock()
 
 	// sort merged results by created_at DESC
 	slices.SortFunc(all, func(a, b whisperstore.WhisperEntry) int {
@@ -229,35 +275,33 @@ func (r *WhisperRegistry) MarkRelayed(murmurID, scope string) error {
 }
 
 // RemoveCursor removes an agent's cursor from all stores.
+//
+// Holds the registry read lock through the entire iteration so the idle-close
+// janitor (which acquires the write lock to call store.Close) cannot race
+// with us and free a *whisperstore.Store mid-operation.
 func (r *WhisperRegistry) RemoveCursor(agentID string) {
 	r.mu.RLock()
-	ledger := r.ledgerStore
-	stores := make(map[string]*whisperstore.Store, len(r.teamStores))
-	for k, v := range r.teamStores {
-		stores[k] = v
-	}
-	r.mu.RUnlock()
+	defer r.mu.RUnlock()
 
-	if ledger != nil {
-		ledger.RemoveCursor(agentID)
+	if r.ledgerStore != nil {
+		r.ledgerStore.RemoveCursor(agentID)
 	}
-	for _, store := range stores {
+	for _, store := range r.teamStores {
 		store.RemoveCursor(agentID)
 	}
 }
 
 // Prune runs cleanup on all stores.
+//
+// Holds the registry read lock through the entire iteration; see RemoveCursor.
+// Prune is a once-an-hour background task, so serializing it against the
+// idle-close janitor (5 min cadence) is cheap.
 func (r *WhisperRegistry) Prune(retention time.Duration) {
 	r.mu.RLock()
-	ledger := r.ledgerStore
-	stores := make(map[string]*whisperstore.Store, len(r.teamStores))
-	for k, v := range r.teamStores {
-		stores[k] = v
-	}
-	r.mu.RUnlock()
+	defer r.mu.RUnlock()
 
-	if ledger != nil {
-		result, err := ledger.Prune(retention)
+	if r.ledgerStore != nil {
+		result, err := r.ledgerStore.Prune(retention)
 		if err != nil {
 			r.logger.Warn("ledger whisper prune failed", "err", err)
 		} else if result.WhispersDeleted > 0 {
@@ -265,7 +309,7 @@ func (r *WhisperRegistry) Prune(retention time.Duration) {
 		}
 	}
 
-	for teamID, store := range stores {
+	for teamID, store := range r.teamStores {
 		result, err := store.Prune(retention)
 		if err != nil {
 			r.logger.Warn("team whisper prune failed", "team_id", teamID, "err", err)
@@ -276,21 +320,18 @@ func (r *WhisperRegistry) Prune(retention time.Duration) {
 }
 
 // EnforceMaxSize runs size enforcement on all stores.
+//
+// Holds the registry read lock through the entire iteration; see RemoveCursor.
 func (r *WhisperRegistry) EnforceMaxSize(maxBytes int64) {
 	r.mu.RLock()
-	ledger := r.ledgerStore
-	stores := make(map[string]*whisperstore.Store, len(r.teamStores))
-	for k, v := range r.teamStores {
-		stores[k] = v
-	}
-	r.mu.RUnlock()
+	defer r.mu.RUnlock()
 
-	if ledger != nil {
-		if err := ledger.EnforceMaxSize(maxBytes); err != nil {
+	if r.ledgerStore != nil {
+		if err := r.ledgerStore.EnforceMaxSize(maxBytes); err != nil {
 			r.logger.Warn("ledger whisper size enforcement failed", "err", err)
 		}
 	}
-	for teamID, store := range stores {
+	for teamID, store := range r.teamStores {
 		if err := store.EnforceMaxSize(maxBytes); err != nil {
 			r.logger.Warn("team whisper size enforcement failed", "team_id", teamID, "err", err)
 		}
@@ -343,7 +384,9 @@ func (r *WhisperRegistry) CloseLedgerStore() {
 
 // CloseTeamStore closes and removes a team whisper store. The next sync of the
 // team workspace re-opens it via AddTeamStore. Called by GC before the
-// workspace rename so SQLite releases its mmap on the to-be-orphaned files.
+// workspace rename so SQLite releases its mmap on the to-be-orphaned files,
+// by the doTeamSync reconcile loop when a team disappears from config, and
+// by the idle-close janitor.
 func (r *WhisperRegistry) CloseTeamStore(teamID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -351,6 +394,49 @@ func (r *WhisperRegistry) CloseTeamStore(teamID string) {
 		_ = store.Close()
 		delete(r.teamStores, teamID)
 	}
+	delete(r.lastAccess, teamID)
+}
+
+// CloseIdleTeamStores closes any team whisper store that hasn't been touched
+// for at least the given threshold. Whisper traffic is sparse (an "every few
+// minutes" workload), so an idle store is pinning ~3 SQLite file descriptors
+// for nothing — reopen on next use is cheap.
+//
+// The ledger store is never subject to idle-close: it's the daemon's
+// continuously-written sink for activity summaries, file-change murmurs,
+// and IPC reads.
+//
+// Returns the number of stores closed (useful for tests and metrics).
+func (r *WhisperRegistry) CloseIdleTeamStores(threshold time.Duration) int {
+	if threshold <= 0 {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cutoff := r.now().Add(-threshold)
+	closed := 0
+	for teamID, store := range r.teamStores {
+		last, ok := r.lastAccess[teamID]
+		if !ok {
+			// store missing from lastAccess is unexpected — seed it and skip
+			r.lastAccess[teamID] = r.now()
+			continue
+		}
+		if last.After(cutoff) {
+			continue
+		}
+		if err := store.Close(); err != nil {
+			r.logger.Warn("failed to close idle team whisper store",
+				"team_id", teamID, "idle_for", r.now().Sub(last), "err", err)
+			continue
+		}
+		delete(r.teamStores, teamID)
+		delete(r.lastAccess, teamID)
+		closed++
+		r.logger.Debug("closed idle team whisper store",
+			"team_id", teamID, "idle_for", r.now().Sub(last))
+	}
+	return closed
 }
 
 // Close closes all stores.
@@ -364,10 +450,12 @@ func (r *WhisperRegistry) Close() error {
 			firstErr = err
 		}
 	}
-	for _, store := range r.teamStores {
+	for teamID, store := range r.teamStores {
 		if err := store.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
+		delete(r.teamStores, teamID)
+		delete(r.lastAccess, teamID)
 	}
 	return firstErr
 }

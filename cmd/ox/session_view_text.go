@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 
 	lipgloss "charm.land/lipgloss/v2"
@@ -68,9 +69,83 @@ func viewAsText(_ *session.Store, storedSession *session.StoredSession, projectR
 		return fmt.Errorf("read markdown file: %w", err)
 	}
 
+	// prepend linkage sections (Pull Requests, Issues, Commits) when the
+	// session's meta.json carries them. Order: PRs, then Issues, then
+	// Commits — coarsest-to-finest granularity reads naturally for a
+	// reviewer scanning "what did this session touch?".
+	linkageSections := renderSessionLinkage(storedSession, projectRoot)
+	if linkageSections != "" {
+		mdContent = append([]byte(linkageSections), mdContent...)
+	}
+
 	// render with glamour and display
 	rendered := ui.RenderMarkdown(string(mdContent))
 	fmt.Print(rendered)
 
 	return nil
+}
+
+// renderSessionLinkage returns the combined markdown for the linkage
+// sections (Pull Requests, Issues, Commits) prepended to a session's
+// rendered view. Reads the session's meta.json once and emits whichever
+// sections are populated, in coarse-to-fine order. Returns "" when none
+// are present.
+func renderSessionLinkage(storedSession *session.StoredSession, projectRoot string) string {
+	if storedSession == nil {
+		return ""
+	}
+	meta := readSessionMetaForView(storedSession.Info.FilePath)
+	if meta == nil {
+		return ""
+	}
+
+	var b strings.Builder
+	if len(meta.LinkedPRs) > 0 {
+		b.WriteString("## Pull Requests\n\n")
+		for _, pr := range meta.LinkedPRs {
+			b.WriteString("- ")
+			b.WriteString(pr)
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	if len(meta.LinkedIssues) > 0 {
+		b.WriteString("## Issues\n\n")
+		for _, issue := range meta.LinkedIssues {
+			b.WriteString("- ")
+			b.WriteString(issue)
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	if len(meta.ProducedCommits) > 0 {
+		b.WriteString("## Commits\n\n")
+		for _, sha := range meta.ProducedCommits {
+			b.WriteString("- ")
+			b.WriteString(resolveCommitDisplay(projectRoot, sha))
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// resolveCommitDisplay returns "<shorthash> <subject>" for a reachable SHA
+// or "<sha> <unreachable>" otherwise. projectRoot may be empty when the
+// view is reading a foreign session (no project context); in that case we
+// fall back to the full SHA without a lookup attempt.
+func resolveCommitDisplay(projectRoot, sha string) string {
+	if projectRoot == "" {
+		return sha
+	}
+	cmd := exec.Command("git", "-C", projectRoot, "log", "-1", "--format=%h %s", sha)
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Sprintf("`%s` <unreachable>", sha)
+	}
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		return fmt.Sprintf("`%s` <unreachable>", sha)
+	}
+	return line
 }

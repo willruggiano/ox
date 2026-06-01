@@ -15,6 +15,7 @@ import (
 	"github.com/sageox/ox/internal/gitutil"
 	"github.com/sageox/ox/internal/kb"
 	"github.com/sageox/ox/internal/manifest"
+	"github.com/sageox/ox/internal/perf"
 )
 
 // ManagedRepoPullOpts configures how pullManagedRepo behaves for a given repo.
@@ -137,6 +138,9 @@ type ManagedRepoPullResult struct {
 // Callers wrap this with repo-specific concerns: auto-clone, backoff, mutex,
 // metrics, post-pull signals.
 func (s *SyncScheduler) pullManagedRepo(ctx context.Context, opts ManagedRepoPullOpts) ManagedRepoPullResult {
+	ctx, span := perf.Start(ctx, "daemon:pull_managed_repo")
+	defer span.End()
+
 	logger := opts.Logger
 	if logger == nil {
 		logger = s.logger
@@ -217,10 +221,13 @@ func (s *SyncScheduler) pullManagedRepo(ctx context.Context, opts ManagedRepoPul
 	}
 
 	// git fetch
+	fetchCtx, fetchSpan := perf.Start(ctx, "git_fetch")
 	fetchArgs := append([]string{"-C", path}, gitHTTPTimeoutFlags()...)
 	fetchArgs = append(fetchArgs, "fetch", "--quiet")
-	fetchCmd := exec.CommandContext(ctx, "git", fetchArgs...)
+	fetchCmd := exec.CommandContext(fetchCtx, "git", fetchArgs...)
 	if output, err := fetchCmd.CombinedOutput(); err != nil {
+		perf.RecordError(fetchSpan, err)
+		fetchSpan.End()
 		detail := gitutil.SanitizeOutput(strings.TrimSpace(string(output)))
 		errMsg := "fetch failed"
 		if detail != "" {
@@ -228,6 +235,7 @@ func (s *SyncScheduler) pullManagedRepo(ctx context.Context, opts ManagedRepoPul
 		}
 		return ManagedRepoPullResult{Err: fmt.Errorf("%s: %w", errMsg, err)}
 	}
+	fetchSpan.End()
 
 	// Track FETCH_HEAD mtime
 	var fetchHeadTime time.Time
@@ -273,10 +281,16 @@ func (s *SyncScheduler) pullManagedRepo(ctx context.Context, opts ManagedRepoPul
 
 	// --- Pull ---
 
+	_, pullSpan := perf.Start(ctx, "git_pull_rebase")
 	pullArgs := append([]string{"-C", path}, gitHTTPTimeoutFlags()...)
 	pullArgs = append(pullArgs, "pull", "--rebase", "--autostash", "--quiet")
 	pullCmd := exec.CommandContext(ctx, "git", pullArgs...)
-	if output, err := pullCmd.CombinedOutput(); err != nil {
+	output, err := pullCmd.CombinedOutput()
+	if err != nil {
+		perf.RecordError(pullSpan, err)
+	}
+	pullSpan.End()
+	if err != nil {
 		detail := gitutil.SanitizeOutput(strings.TrimSpace(string(output)))
 		logger.Warn("pull failed", "error", err, "output", detail, "repo", repoName)
 
@@ -313,12 +327,13 @@ func (s *SyncScheduler) pullManagedRepo(ctx context.Context, opts ManagedRepoPul
 				}
 			}
 
-			// use a fresh context for abort — the parent ctx may be canceled
-			abortCtx, abortCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_, abortErr := gitutil.RunGit(abortCtx, path, "rebase", "--abort")
-			abortCancel()
+			// AuditAndAbort: structured pre/post logs capture HEAD SHA,
+			// unmerged file list, and stash count BEFORE discarding state,
+			// so silent recovery from a wedged rebase leaves an audit
+			// trail. See ox-ooy3 and .claude/rules/daemon-git.md.
+			abortErr := gitutil.AuditAndAbort(ctx, path, gitutil.AuditOpRebase, "auto-resolve exhausted", logger)
 			if abortErr != nil {
-				logger.Error("rebase abort failed, repo stuck in rebase state", "repo", repoName, "error", abortErr)
+				logger.Error("rebase abort failed, repo stuck in rebase state", "op", "rebase_abort_failed", "repo", repoName, "error", abortErr)
 				result.Issue = &DaemonIssue{
 					Type:            IssueTypeRebaseStuck,
 					Severity:        SeverityError,
@@ -364,8 +379,17 @@ func (s *SyncScheduler) pullManagedRepo(ctx context.Context, opts ManagedRepoPul
 }
 
 // detectDivergedBranchesAt checks if local and remote branches have both
-// progressed independently at the given repo path.
+// progressed independently at the given repo path. Returns false when the
+// repo is shallow — rev-list counts truncate at the shallow boundary and
+// would falsely report "diverged" for branches that share ancestry past
+// the shallow horizon. False is safe: it just means we don't auto-trigger
+// a rebase based on divergence detection; the next sync will retry.
 func detectDivergedBranchesAt(ctx context.Context, repoPath string) bool {
+	if state, _ := gitutil.InspectRepo(repoPath); state.Shallow {
+		slog.Debug("divergence check skipped: shallow clone",
+			"repo", repoPath, "reason", state.Reason)
+		return false
+	}
 	cmd := exec.CommandContext(ctx, "git", "-C", repoPath,
 		"rev-list", "--left-right", "--count", "origin/main...HEAD")
 	output, err := cmd.Output()

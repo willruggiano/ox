@@ -221,3 +221,33 @@ func TestParseQueryArgs_SourceWithModeKnn(t *testing.T) {
 	assert.Equal(t, "knn", qa.mode)
 	assert.Equal(t, "search query", qa.query)
 }
+
+func TestParseQueryArgs_LocalFlag(t *testing.T) {
+	t.Parallel()
+	qa, err := parseQueryArgs([]string{"--local", "cache"})
+	require.NoError(t, err)
+	assert.Equal(t, "local", qa.source)
+	assert.Equal(t, "cache", qa.query)
+}
+
+func TestParseQueryArgs_SourceLocal(t *testing.T) {
+	t.Parallel()
+	qa, err := parseQueryArgs([]string{"--source=local", "cache"})
+	require.NoError(t, err)
+	assert.Equal(t, "local", qa.source)
+}
+
+func TestParseQueryArgs_SourceLocalLedgerAlias(t *testing.T) {
+	t.Parallel()
+	qa, err := parseQueryArgs([]string{"--source=local-ledger", "cache"})
+	require.NoError(t, err)
+	assert.Equal(t, "local", qa.source)
+}
+
+func TestParseQueryArgs_JSONFlag(t *testing.T) {
+	t.Parallel()
+	qa, err := parseQueryArgs([]string{"--local", "--json", "cache"})
+	require.NoError(t, err)
+	assert.True(t, qa.jsonOnly)
+	assert.Equal(t, "local", qa.source)
+}

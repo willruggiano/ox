@@ -18,17 +18,19 @@ import (
 	"github.com/sageox/ox/internal/codedb/search"
 	"github.com/sageox/ox/internal/config"
 	"github.com/sageox/ox/internal/endpoint"
+	"github.com/sageox/ox/internal/ledgersearch"
 	"github.com/sageox/ox/internal/observability"
 )
 
 // queryArgs holds parsed arguments for the query command.
 type queryArgs struct {
-	query  string
-	mode   string
-	limit  int
-	teamID string
-	repoID string
-	source string // "team" (default), "code", "all"
+	query    string
+	mode     string
+	limit    int
+	teamID   string
+	repoID   string
+	source   string // "team" (default), "code", "local", "all"
+	jsonOnly bool   // emit machine-readable JSON, no decoration
 }
 
 // parseQueryArgs extracts flags and the positional query from raw args.
@@ -78,6 +80,10 @@ func parseQueryArgs(args []string) (*queryArgs, error) {
 			i++
 		case strings.HasPrefix(args[i], "--source="):
 			qa.source = strings.TrimPrefix(args[i], "--source=")
+		case args[i] == "--local":
+			qa.source = "local"
+		case args[i] == "--json":
+			qa.jsonOnly = true
 		case !strings.HasPrefix(args[i], "--"):
 			qa.query = args[i]
 		}
@@ -98,12 +104,16 @@ func parseQueryArgs(args []string) (*queryArgs, error) {
 	if qa.source == "teamctx" {
 		qa.source = "team"
 	}
+	// accept "local-ledger" as a more explicit synonym for --source=local
+	if qa.source == "local-ledger" {
+		qa.source = "local"
+	}
 
 	switch qa.source {
-	case "all", "team", "code":
+	case "all", "team", "code", "local":
 		// ok
 	default:
-		return nil, fmt.Errorf("invalid source %q: must be all, team, or code", qa.source)
+		return nil, fmt.Errorf("invalid source %q: must be all, team, code, or local", qa.source)
 	}
 
 	return qa, nil
@@ -116,29 +126,35 @@ Flags:
   --mode MODE    Search mode: hybrid, knn, or bm25 (default: hybrid)
   --team ID      Team ID to search (default: from project config)
   --repo ID      Repo ID to search (default: from project config)
-  --source SRC   Search source: team (default), code, all
+  --source SRC   Search source: team (default), code, local, all
+  --local        Shorthand for --source=local (zero-network ledger search)
+  --json         Emit machine-readable JSON only (no decoration)
 
 Sources:
   team      Search team discussions, docs, and session history (default)
   code      Search local code index only (queries)
+  local     Search locally-cached ledger only (zero network calls)
   all       Search both team context and local code index
 
 Searches across team discussions, docs, and session history.
 For code search, use: ox code search "<pattern>" or --source=code
+For pre-prompt hooks needing instant local context, use: --local
 
 Also available as: ox agent <id> query "search text"`
 
 // combinedQueryResponse holds results from both team context and local code search.
 type combinedQueryResponse struct {
-	TeamContext *api.QueryResponse `json:"team_context,omitempty"`
-	CodeResults []search.Result    `json:"code_results,omitempty"` // used by --full-json only
+	TeamContext  *api.QueryResponse    `json:"team_context,omitempty"`
+	CodeResults  []search.Result       `json:"code_results,omitempty"` // used by --full-json only
+	LocalResults []ledgersearch.Result `json:"local_results,omitempty"`
 }
 
 // compactQueryResponse is the default agent query output — minimal context footprint.
 type compactQueryResponse struct {
-	TeamContext *api.QueryResponse    `json:"team_context,omitempty"`
-	CodeResults []compactSearchResult `json:"code_results,omitempty"`
-	Guidance    string                `json:"guidance,omitempty"`
+	TeamContext  *api.QueryResponse    `json:"team_context,omitempty"`
+	CodeResults  []compactSearchResult `json:"code_results,omitempty"`
+	LocalResults []ledgersearch.Result `json:"local_results,omitempty"`
+	Guidance     string                `json:"guidance,omitempty"`
 }
 
 // runAgentQuery handles `ox agent <id> query "search text"`.
@@ -176,6 +192,15 @@ func executeQuery(qa *queryArgs, agentID string, agentType string) (int, error) 
 
 	combined := &combinedQueryResponse{}
 
+	// --source=local is a zero-network fast path: search ONLY the cached ledger
+	// (sessions + murmurs). Used by UserPromptSubmit hooks where latency matters.
+	// Fail-open: empty cache or read error returns empty results, exit 0.
+	if qa.source == "local" {
+		results := queryLocalLedger(qa, projectRoot)
+		combined.LocalResults = results
+		return writeQueryResponse(combined, qa)
+	}
+
 	// query team context if source is "all" or "team"
 	if qa.source == "all" || qa.source == "team" {
 		resp, err := queryTeamContext(qa, projectRoot, agentID, agentType)
@@ -203,21 +228,26 @@ func executeQuery(qa *queryArgs, agentID string, agentType string) (int, error) 
 		}
 	}
 
-	// compact output — minimal context footprint for agents
+	combined.CodeResults = codeResults
+	return writeQueryResponse(combined, qa)
+}
+
+// writeQueryResponse marshals the combined response and writes JSON to stdout.
+// Returns bytes written for context tracking.
+func writeQueryResponse(combined *combinedQueryResponse, qa *queryArgs) (int, error) {
 	resp := compactQueryResponse{
-		TeamContext: combined.TeamContext,
+		TeamContext:  combined.TeamContext,
+		LocalResults: combined.LocalResults,
 	}
-	if len(codeResults) > 0 {
-		compact := compactSearchResults(codeResults, qa.limit)
+	if len(combined.CodeResults) > 0 {
+		compact := compactSearchResults(combined.CodeResults, qa.limit)
 		resp.CodeResults = compact.Results
 		resp.Guidance = compact.Guidance
 	}
 
-	// Attach combined result count to the root span. Sums team-context
-	// hits and code hits since this command can search either or both
-	// (per --source). Counts the *raw* results before --limit so the
-	// metric reflects what the search actually returned.
-	totalResults := len(codeResults)
+	// Attach combined result count to the root span. Counts the *raw* results
+	// before --limit so the metric reflects what the search actually returned.
+	totalResults := len(combined.CodeResults) + len(combined.LocalResults)
 	if combined.TeamContext != nil {
 		totalResults += len(combined.TeamContext.Results)
 	}
@@ -231,7 +261,7 @@ func executeQuery(qa *queryArgs, agentID string, agentType string) (int, error) 
 	}
 
 	outputBytes := buf.Len()
-	_, err = buf.WriteTo(os.Stdout)
+	_, err := buf.WriteTo(os.Stdout)
 	return outputBytes, err
 }
 
@@ -315,4 +345,51 @@ func queryCodeDB(qa *queryArgs, projectRoot string) ([]search.Result, error) {
 	}
 
 	return db.Search(context.Background(), qa.query)
+}
+
+// queryLocalLedger searches the locally-cached ledger (sessions + murmurs) with
+// zero network calls. Always returns slice (possibly empty) and never errors —
+// fail-open is required by hook callers that must exit 0 on missing cache.
+//
+// Hook contract (ox-tshf):
+//   - Output JSON shape: {"local_results": [{score, text, doc_type, file_path,
+//     source_type:"ledger", source_id, created_at}, ...]}
+//   - Empty cache, missing ledger, or any read error -> {"local_results": null}
+//   - Exit code: 0 always for --source=local (no auth/network failure modes).
+func queryLocalLedger(qa *queryArgs, projectRoot string) []ledgersearch.Result {
+	ledgerPath := resolveLocalLedgerPath(projectRoot)
+	if ledgerPath == "" {
+		slog.Debug("local ledger path unresolved, returning empty results")
+		return nil
+	}
+	results, err := ledgersearch.Search(ledgersearch.Options{
+		LedgerPath: ledgerPath,
+		Query:      qa.query,
+		Limit:      qa.limit,
+	})
+	if err != nil {
+		// ledgersearch.Search is documented fail-open, but defend against
+		// future changes — never propagate errors to hook callers.
+		slog.Debug("local ledger search returned error, swallowing", "err", err)
+		return nil
+	}
+	return results
+}
+
+// resolveLocalLedgerPath finds the cached ledger checkout for the current project.
+// Returns "" if the project isn't initialized or has no resolvable ledger.
+// This is intentionally never an error path — see queryLocalLedger's contract.
+//
+// Uses the canonical ProjectContext resolver per .claude/rules/endpoints.md
+// so we honor the same local-config-aware path resolution chain other
+// cmd/ox commands use, rather than constructing the path manually.
+func resolveLocalLedgerPath(projectRoot string) string {
+	if projectRoot == "" {
+		return ""
+	}
+	pctx, err := config.LoadProjectContext(projectRoot)
+	if err != nil || pctx == nil {
+		return ""
+	}
+	return pctx.DefaultLedgerPath()
 }

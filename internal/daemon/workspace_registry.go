@@ -393,17 +393,59 @@ func (r *WorkspaceRegistry) GetWorkspace(id string) *WorkspaceState {
 }
 
 // GetTeamContexts returns copies of all team context workspaces.
+//
+// Filters out workspaces whose Path matches the GC staging suffixes
+// (`.new`, `.old`, `.gc-*`) so a partial / failed blue-green reclone
+// can't trick downstream code (e.g., the whisper registry) into opening
+// SQLite stores against ephemeral GC carcasses. The canonical path
+// returned by paths.TeamContextDir never has these suffixes, so this
+// is pure defense-in-depth.
 func (r *WorkspaceRegistry) GetTeamContexts() []WorkspaceState {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	var result []WorkspaceState
 	for _, ws := range r.workspaces {
-		if ws.Type == WorkspaceTypeTeamContext {
-			result = append(result, *ws)
+		if ws.Type != WorkspaceTypeTeamContext {
+			continue
 		}
+		if isGCStagingPath(ws.Path) {
+			continue
+		}
+		result = append(result, *ws)
 	}
 	return result
+}
+
+// isGCStagingPath reports whether a path is a transient GC staging directory.
+//
+// The exact suffixes are the ones produced by runBlueGreenGC in sync_gc.go:
+//
+//	<team>.new          // freshly-cloned candidate
+//	<team>.old          // pre-swap snapshot
+//	<team>.gc-diff      // diff capture of local state
+//	<team>.gc-untracked // backup of untracked files
+//	<team>.gc-lock      // lockfile
+//	<team>.gc-cache     // cache backup
+//
+// We match against the explicit set rather than a `.gc-` substring so a
+// legitimate path that happens to contain ".gc-" elsewhere in its basename
+// (e.g., a team slug "abc.gc-team") is not accidentally filtered.
+func isGCStagingPath(p string) bool {
+	if p == "" {
+		return false
+	}
+	base := filepath.Base(p)
+	switch {
+	case strings.HasSuffix(base, ".new"),
+		strings.HasSuffix(base, ".old"),
+		strings.HasSuffix(base, ".gc-diff"),
+		strings.HasSuffix(base, ".gc-untracked"),
+		strings.HasSuffix(base, ".gc-lock"),
+		strings.HasSuffix(base, ".gc-cache"):
+		return true
+	}
+	return false
 }
 
 // GetAllWorkspaces returns copies of all workspaces (ledger + team contexts).

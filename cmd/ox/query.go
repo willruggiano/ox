@@ -19,6 +19,7 @@ var queryCmd = &cobra.Command{
 Sources:
   team      Search team discussions, docs, and session history (default)
   code      Search local code index only (queries)
+  local     Search locally-cached ledger ONLY (zero network, fast hook path)
   all       Search both team context and local code index
 
 Examples:
@@ -26,7 +27,9 @@ Examples:
   ox query "database migration patterns" --limit 10
   ox query "deployment process" --team team_abc123
   ox query "error handling" --source=code
-  ox query "auth flow" --source=all`,
+  ox query "auth flow" --source=all
+  ox query "cache invalidation" --local
+  ox query "auth flow" --local --json`,
 	Args: cobra.ExactArgs(1),
 	RunE: runQuery,
 }
@@ -36,7 +39,10 @@ func init() {
 	queryCmd.Flags().String("team", "", "team ID to search (default: from project config)")
 	queryCmd.Flags().String("repo", "", "repo ID to search (default: from project config)")
 	queryCmd.Flags().String("mode", "hybrid", "search mode: hybrid, knn, or bm25")
-	queryCmd.Flags().String("source", "team", "search source: team (default), code, all")
+	queryCmd.Flags().String("source", "team", "search source: team (default), code, local, all")
+	// --local is shorthand for --source=local; convenient for hook callers
+	queryCmd.Flags().Bool("local", false, "search the locally-cached ledger only (zero network)")
+	queryCmd.Flags().Bool("json", false, "emit machine-readable JSON (default in agent context)")
 }
 
 // runQuery handles the top-level `ox query "search text"` command.
@@ -47,24 +53,36 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	repoID, _ := cmd.Flags().GetString("repo")
 	mode, _ := cmd.Flags().GetString("mode")
 	source, _ := cmd.Flags().GetString("source")
+	localOnly, _ := cmd.Flags().GetBool("local")
+	jsonOut, _ := cmd.Flags().GetBool("json")
 
 	query := strings.TrimSpace(args[0])
 	if query == "" {
 		return fmt.Errorf("query text is required")
 	}
 
+	// --local is sugar for --source=local; --local wins if both given
+	if localOnly {
+		source = "local"
+	}
+
 	qa := &queryArgs{
-		query:  query,
-		mode:   mode,
-		limit:  limit,
-		teamID: teamID,
-		repoID: repoID,
-		source: source,
+		query:    query,
+		mode:     mode,
+		limit:    limit,
+		teamID:   teamID,
+		repoID:   repoID,
+		source:   source,
+		jsonOnly: jsonOut,
 	}
 
 	// normalize teamctx alias
 	if qa.source == "teamctx" {
 		qa.source = "team"
+	}
+	// accept "local-ledger" as a more explicit synonym
+	if qa.source == "local-ledger" {
+		qa.source = "local"
 	}
 
 	switch qa.mode {
@@ -75,10 +93,10 @@ func runQuery(cmd *cobra.Command, args []string) error {
 	}
 
 	switch qa.source {
-	case "all", "team", "code":
+	case "all", "team", "code", "local":
 		// ok
 	default:
-		return fmt.Errorf("invalid source %q: must be all, team, or code", qa.source)
+		return fmt.Errorf("invalid source %q: must be all, team, code, or local", qa.source)
 	}
 
 	agentID, agentType := detectAgentContext()

@@ -297,6 +297,37 @@ type UserNotice struct {
 	Message string `json:"message"`
 }
 
+// CloudMCPSuggestedTools is the canonical list of cloud MCP tool names
+// agents should consider when local context surfaces are sparse or
+// unavailable. Sourced here so additions don't require touching the
+// ephemeral-hint builder.
+//
+// Order matters: list the highest-leverage tools first — agents that
+// trim the list (token budget pressure) keep the most useful entries.
+var CloudMCPSuggestedTools = []string{
+	"sageox.search_team_context",
+	"sageox.search_codebase",
+	"sageox.kb_query",
+	"sageox.session_history",
+}
+
+// EphemeralHint surfaces cloud MCP routing guidance in the prime payload.
+// The CloudMCPEndpoint and SuggestedTools fields are emitted
+// unconditionally — the cloud MCP server is a valid context source on a
+// dev laptop too, it's just not the preferred one. The Recommendation
+// and LocalDataSparse fields are emitted only when the runtime can't
+// reliably satisfy context queries locally (no persistent disk OR no
+// long-lived helper), at which point the calling agent should prefer
+// MCP over local caches.
+type EphemeralHint struct {
+	Active           bool     `json:"active"`
+	Reason           string   `json:"reason,omitempty"`             // env var or venue marker that triggered ephemeral mode
+	LocalDataSparse  bool     `json:"local_data_sparse,omitempty"`  // true when local caches are missing/partial
+	CloudMCPEndpoint string   `json:"cloud_mcp_endpoint,omitempty"` // e.g. https://api.sageox.ai/mcp
+	Recommendation   string   `json:"recommendation,omitempty"`     // single-line guidance for the agent
+	SuggestedTools   []string `json:"suggested_tools,omitempty"`    // cloud MCP tool names to prefer
+}
+
 // Output is the structured response for agent bootstrap (prime)
 type Output struct {
 	Status           string                     `json:"status"` // fresh, degraded, unavailable
@@ -367,4 +398,8 @@ type Output struct {
 	// Per-step timing instrumentation
 	ElapsedMs int64            `json:"elapsed_ms,omitempty"` // total prime execution time
 	Timing    map[string]int64 `json:"timing,omitempty"`     // per-phase timing (ms)
+	// Ephemeral-mode hint: nil when not in ephemeral mode. When set, agents
+	// should prefer the cloud MCP server for context ops since local caches
+	// are sparse. See docs/ai/adr/adr-ephemeral-mode.md.
+	EphemeralHint *EphemeralHint `json:"ephemeral_hint,omitempty"`
 }

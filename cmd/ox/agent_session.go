@@ -808,6 +808,12 @@ func outputSessionStopJSON(inst *agentinstance.Instance, state *session.Recordin
 		output.LedgerSessionDir = processResult.LedgerSessionDir
 		output.UploadWarning = processResult.UploadWarning
 		output.DataWarnings = processResult.DataWarnings
+		output.StopReason = processResult.StopReason
+		output.StopDetail = processResult.StopDetail
+		output.StopSource = processResult.StopSource
+		output.StopPatternID = processResult.StopPatternID
+		output.StopResetsAtRaw = processResult.StopResetsAtRaw
+		output.StopResetsAt = processResult.StopResetsAt
 		// async mode: summary_prompt is empty, update guidance
 		if processResult.SummaryPrompt == "" {
 			output.Guidance = "Session stopped and saved. Upload and summary generation happen automatically in the background."
@@ -1184,7 +1190,20 @@ func processAgentSession(projectRoot string, state *session.RecordingState) (*ag
 	// honors (in priority order): the legacy SAGEOX_ASYNC_SESSION_UPLOAD /
 	// OX_SESSION_INLINE_SUMMARY env vars (deprecated, one-release shim), the
 	// `agent.summarizer` user-config key, and finally the inline default.
-	asyncUpload := summarizerMode == config.AgentSummarizerDelegated
+	// Route sync-vs-async through the capability-aware dispatcher in
+	// internal/session. When the daemon isn't viable (sandbox / ephemeral
+	// / OX_NO_DAEMON), the dispatcher forces sync even if the user opted
+	// into `delegated` — otherwise the daemon RPC silently no-ops and
+	// the session sits in the cache until `ox doctor` sweeps it. Prior
+	// to this dispatcher, `delegated` + no daemon = lost upload
+	// orchestration in every sandbox.
+	userPrefersAsync := summarizerMode == config.AgentSummarizerDelegated
+	finalizeMode := finalizeModeForSessionStop(userPrefersAsync)
+	asyncUpload := finalizeMode == session.FinalizeAsyncDaemon
+	if userPrefersAsync && !asyncUpload {
+		slog.Info("session finalize: delegated summarizer requested but daemon not viable — falling back to sync upload",
+			"session", sessionName)
+	}
 
 	if ledgerErr != nil {
 		// couldn't resolve ledger path - skip upload
@@ -1259,6 +1278,14 @@ func processAgentSession(projectRoot string, state *session.RecordingState) (*ag
 	return result, nil
 }
 
+// finalizeModeForSessionStop resolves the session-stop dispatch mode using
+// the same daemon availability contract the rest of the CLI obeys. The
+// runtime capability probe catches sandboxes / OX_NO_DAEMON, while the
+// historical SAGEOX_DAEMON=false off-switch is enforced in daemon.IsDaemonDisabled.
+func finalizeModeForSessionStop(userPrefersAsync bool) session.FinalizeDispatchMode {
+	return session.ChooseFinalizeMode(!daemon.IsDaemonDisabled(), userPrefersAsync)
+}
+
 // uploadSessionToLedger copies content files from cache to ledger, uploads to LFS,
 // writes meta.json, and commits+pushes. This is phase 2 of the two-phase design:
 
@@ -1287,7 +1314,16 @@ func uploadSessionToLedger(projectRoot string, result *agentSessionResult, state
 		Title(state.Title).
 		EntryCount(result.EntryCount).
 		Summary(result.Summary).
-		StopReason(session.StopReasonStopped)
+		StopReason(session.StopReasonStopped).
+		ProducedCommits(state.ProducedCommits).
+		LinkedPRs(state.LinkedPRs).
+		LinkedIssues(state.LinkedIssues).
+		// staged: meta.json is being written here, BEFORE the LFS upload +
+		// git push below. The transition to uploaded (and the notify) happens
+		// only after commitAndPushLedger succeeds — see the M5 block at the
+		// end of this function. Setting uploaded here would lie about a
+		// session that may never reach the remote.
+		LinkageStatus(lfs.LinkageStatusStaged)
 
 	// inject sageox contribution score from cache file into meta.json,
 	// then clean up the score file to prevent stale scores leaking into future sessions
@@ -1366,6 +1402,14 @@ func uploadSessionToLedger(projectRoot string, result *agentSessionResult, state
 			slog.Warn("LFS pointer file write failed after push", "error", writeErr, "session", sessionName)
 		}
 	}
+
+	// M5: the push succeeded — the session URL is now viewable. Transition
+	// LinkageStatus to uploaded and best-effort notify the SageOx server so
+	// the (v2) GitHub App reconciler can refresh any PR sticky comment. The
+	// notify is fire-and-forget: a failure leaves the session in
+	// notify_failed for `ox doctor` to retry, and never affects the
+	// already-successful upload.
+	finalizeLinkageAfterPush(projectRoot, sessionDir, meta, sessionName)
 
 	return nil
 }

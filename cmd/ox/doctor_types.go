@@ -108,6 +108,8 @@ const (
 	CheckSlugGitignoreMissing   = "gitignore-missing" // .sageox/.gitignore in ledger/team checkouts
 	CheckSlugGitFsck            = "git-fsck"
 	CheckSlugGitLock            = "git-lock"
+	CheckSlugRepoCompleteness   = "repo-completeness"
+	CheckSlugGitAlternates      = "git-alternates"
 
 	// Authentication checks
 	CheckSlugAuthStatus      = "auth-status"
@@ -133,6 +135,7 @@ const (
 	CheckSlugSessionStartHookBug = "session-start-hook-bug"
 	CheckSlugGitCommitHooks      = "git-commit-hooks"
 	CheckSlugAdapterPrimeBlocks  = "adapter-prime-blocks"
+	CheckSlugCloudQueryConfig    = "userpromptsubmit-cloud-query"
 
 	// Team Context checks
 	CheckSlugTeamRegistration   = "team-registration"

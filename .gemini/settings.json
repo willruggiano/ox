@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "PostToolUse": "if command -v ox \u003e/dev/null 2\u003e\u00261; then AGENT_ENV=gemini ox agent hook PostToolUse 2\u003e\u00261 || true; fi",
+    "PreToolUse": "if command -v ox \u003e/dev/null 2\u003e\u00261; then AGENT_ENV=gemini ox agent hook PreToolUse 2\u003e\u00261 || true; fi",
+    "Stop": "if command -v ox \u003e/dev/null 2\u003e\u00261; then AGENT_ENV=gemini ox agent hook Stop 2\u003e\u00261 || true; fi"
+  }
+}

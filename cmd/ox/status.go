@@ -219,13 +219,32 @@ func getGitRepoStatus(repoPath string, lastSync time.Time, hasLastSync bool) git
 	// .git/rebase-apply. Cheap (two stat calls); always run.
 	status.RebaseInProgress = gitutil.IsRebaseInProgress(repoPath)
 
-	// ahead/behind count vs upstream. Silent if no upstream is
-	// configured (offline-only repo) — that's not a wedge, just a fact
-	// of the workspace. Failures here are non-fatal; status UI would
-	// rather under-report than refuse to render.
-	if ahead, behind, ok := gitAheadBehind(repoPath); ok {
-		status.AheadCount = ahead
-		status.BehindCount = behind
+	// Shallow detection. rev-list --left-right needs the commit graph;
+	// when truncated by `--depth N`, divergence counts are wrong (they
+	// silently truncate at the shallow boundary). Partial clones
+	// (--filter=blob:none) keep the commit graph intact — divergence
+	// still works there, so we don't suppress for Partial here.
+	//
+	// If InspectRepo itself fails (e.g. transient rev-parse error on a
+	// half-initialized repo), skip the divergence query rather than
+	// risk computing counts against an unknown clone state.
+	repoState, inspectErr := gitutil.InspectRepo(repoPath)
+	switch {
+	case inspectErr != nil:
+		status.IncompleteHistory = true
+		status.IncompleteReason = "history detection failed"
+	case repoState.Shallow:
+		status.IncompleteHistory = true
+		status.IncompleteReason = repoState.Reason
+	default:
+		// ahead/behind count vs upstream. Silent if no upstream is
+		// configured (offline-only repo) — that's not a wedge, just a fact
+		// of the workspace. Failures here are non-fatal; status UI would
+		// rather under-report than refuse to render.
+		if ahead, behind, ok := gitAheadBehind(repoPath); ok {
+			status.AheadCount = ahead
+			status.BehindCount = behind
+		}
 	}
 
 	// check if synced with remote (only if uncommitted count is 0
@@ -1500,6 +1519,10 @@ daemon health, and a tree view of all SageOx directory locations.`,
 		// show contextual tip
 		userCfg, _ := config.LoadUserConfig()
 		tips.MaybeShow("status", tips.AlwaysShow, cfg.Quiet, !userCfg.AreTipsEnabled(), cfg.JSON)
+
+		// trailing PAT expiry warning — internally suppressed in ephemeral
+		// mode, when stderr isn't a TTY, and for never-expires tokens.
+		_ = auth.CheckAndWarnExpiry(cmd.Context(), currentEndpoint, os.Stderr)
 
 		return nil
 	},

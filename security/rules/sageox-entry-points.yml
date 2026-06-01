@@ -1,0 +1,217 @@
+# ox CLI OpenGrep rules — entry points, sinks, and ox-CLI-specific safety primitives.
+# Sister to sageox-monorepo/security/rules/sageox-entry-points.yml; same rule format
+# (Semgrep-compatible, runs unchanged on OpenGrep).
+#
+# Source for the pipeline shape:
+#   https://www.synthesia.io/post/automating-code-security-reviews-with-claude-mythos-level-capabilities
+# Why OpenGrep over upstream Semgrep CE:
+#   https://appsecsanta.com/sast-tools/opengrep-vs-semgrep
+#
+# Entry points and sinks here are ox-CLI-specific (cobra commands, MCP server tool
+# handlers, gitleaks-redaction-bypass detection) — different from the monorepo's
+# api-go HTTP handler / BFF route shape.
+
+rules:
+  # ---------------------------------------------------------------------------
+  # ENTRY POINTS
+  # ---------------------------------------------------------------------------
+
+  - id: sageox-cli.entry-point.cobra-command
+    severity: INFO
+    languages: [go]
+    message: |
+      Cobra command Run/RunE handler — ox CLI subcommand entry point.
+      Inputs come from os.Args (trusted shell), but downstream code may pass
+      arg values into Ledger writes / sub-process spawning / MCP dispatch.
+      Hunters should trace from here to sinks.
+    metadata:
+      class: entry-point
+      sageox_threat: "security/SECURITY.md#trust-boundaries"
+    pattern-either:
+      - pattern: |
+          &cobra.Command{
+            ...
+            Run: $RUN,
+            ...
+          }
+      - pattern: |
+          &cobra.Command{
+            ...
+            RunE: $RUN,
+            ...
+          }
+
+  - id: sageox-cli.entry-point.mcp-tool-handler
+    severity: INFO
+    languages: [go]
+    message: |
+      MCP tool handler entry point. The CALLER is an LLM (potentially driven
+      by attacker-controlled prompts). Tool name + args from the model MUST
+      be validated against the registered tool registry before dispatch.
+      See SECURITY.md "MCP trust boundary".
+    metadata:
+      class: entry-point
+      sageox_threat: "security/SECURITY.md#mcp-trust-boundary"
+    pattern-either:
+      - pattern: |
+          func ($SELF $TYPE) Handle($CTX context.Context, $REQ $REQTYPE) ($RESP, error) { ... }
+    paths:
+      include:
+        - "internal/mcp/**"
+
+  - id: sageox-cli.entry-point.oauth-callback
+    severity: INFO
+    languages: [go]
+    message: |
+      OAuth device-flow callback handler. Token exchange happens here; downstream
+      writes the token to disk (must be mode 0600) or the OS keychain (correct).
+    metadata:
+      class: entry-point
+      sageox_threat: "security/SECURITY.md#oauth--token-caching"
+    paths:
+      include:
+        - "cmd/ox/login.go"
+        - "internal/auth/**"
+
+  # ---------------------------------------------------------------------------
+  # SINKS
+  # ---------------------------------------------------------------------------
+
+  - id: sageox-cli.sink.shell-exec
+    severity: WARNING
+    languages: [go]
+    message: |
+      Shell exec sink. ox CLI shells out to git/gh/ffmpeg/etc. constantly;
+      the question is whether ANY arg is reachable from untrusted input
+      (Ledger content, MCP tool args) without an allowlist. If yes, command
+      injection.
+    metadata:
+      class: sink
+      sageox_threat: "security/SECURITY.md#sub-process-spawning"
+      cwe: "CWE-78"
+    pattern-either:
+      - pattern: exec.Command($CMD, ...)
+      - pattern: exec.CommandContext($CTX, $CMD, ...)
+
+  - id: sageox-cli.sink.shell-exec-via-sh-c
+    severity: ERROR
+    languages: [go]
+    message: |
+      `exec.Command("sh", "-c", ...)` is the antipattern — concatenated string
+      args bypass exec's argv-array protection and allow shell metacharacter
+      injection. Use the variadic form: exec.Command(name, arg1, arg2, ...).
+    metadata:
+      class: sink
+      sageox_threat: "security/SECURITY.md#sub-process-spawning"
+      cwe: "CWE-78"
+    pattern-either:
+      - pattern: exec.Command("sh", "-c", $CMD)
+      - pattern: exec.Command("bash", "-c", $CMD)
+      - pattern: exec.CommandContext($CTX, "sh", "-c", $CMD)
+      - pattern: exec.CommandContext($CTX, "bash", "-c", $CMD)
+
+  - id: sageox-cli.sink.fs-write-outside-allowed-roots
+    severity: WARNING
+    languages: [go]
+    message: |
+      Filesystem write. ox CLI's allowed write roots are ~/.config/ox/,
+      ~/.cache/ox/, ./.ox/, and explicit user-supplied targets. Writes to
+      arbitrary paths (especially constructed via filepath.Join with
+      user-controlled components) need path-traversal validation.
+    metadata:
+      class: sink
+      sageox_threat: "security/SECURITY.md#local-filesystem-writes"
+      cwe: "CWE-22"
+    pattern-either:
+      - pattern: os.WriteFile($PATH, ...)
+      - pattern: os.Create($PATH)
+      - pattern: os.OpenFile($PATH, ...)
+
+  # ---------------------------------------------------------------------------
+  # GITLEAKS REDACTION CHOKEPOINT — bypass detection
+  # ---------------------------------------------------------------------------
+
+  - id: sageox-cli.primitive-violation.raw-jsonl-bypass
+    severity: ERROR
+    languages: [go]
+    message: |
+      Direct write to raw.jsonl detected. The ONLY sanctioned writer is
+      internal/session/raw_writer.go's RawWriter — it applies the gitleaks
+      redaction layer before persisting. Bypassing it allows secrets to land
+      in the Ledger unredacted, which is a P0 leak path.
+      The build-time check `make check-raw-writer-chokepoint` enforces this
+      at compile/test time; this rule catches the same in static analysis so
+      AI hunters notice sneaky bypass attempts during review.
+    metadata:
+      class: sageox-primitive-violation
+      sageox_threat: "security/SECURITY.md#secret-handling-primitives-use-these-dont-reinvent"
+    pattern-either:
+      - pattern-regex: '\.WriteString\([^)]*"raw\.jsonl"'
+      - pattern-regex: 'os\.OpenFile\([^,]*"raw\.jsonl"'
+      - pattern-regex: 'os\.Create\([^)]*"raw\.jsonl"'
+      - pattern-regex: 'os\.WriteFile\([^,]*"raw\.jsonl"'
+    paths:
+      exclude:
+        - "internal/session/raw_writer.go"      # the chokepoint itself
+        - "internal/session/raw_writer_test.go"
+        - "**/*_test.go"
+
+  # ---------------------------------------------------------------------------
+  # MCP TRUST BOUNDARY
+  # ---------------------------------------------------------------------------
+
+  - id: sageox-cli.mcp-trust.unallowlisted-tool-dispatch
+    severity: WARNING
+    languages: [go]
+    message: |
+      MCP tool dispatch where the tool name appears to come from caller
+      (model) input. Must validate against the registered tool registry
+      first. Free-form dispatch from model output is a P0 LLM trust-boundary
+      violation. See SECURITY.md "MCP trust boundary".
+    metadata:
+      class: mcp-trust
+      sageox_threat: "security/SECURITY.md#mcp-trust-boundary"
+    pattern-either:
+      - pattern: $REGISTRY[$NAME]($ARGS, ...)
+      - pattern: $TOOLS.GetTool($NAME).Invoke(...)
+    paths:
+      include:
+        - "internal/mcp/**"
+
+  # ---------------------------------------------------------------------------
+  # SECRET / TOKEN HANDLING
+  # ---------------------------------------------------------------------------
+
+  - id: sageox-cli.secret-handling.byok-key-read
+    severity: INFO
+    languages: [go]
+    message: |
+      BYOK API key read. Validators should check the key is sourced from
+      OS keychain (correct), then env var (acceptable if documented +
+      never logged), then config file (acceptable if mode 0600), and is
+      never echoed in error messages or logged.
+    metadata:
+      class: secret-or-token-handling
+      sageox_threat: "security/SECURITY.md#secret-handling-primitives-use-these-dont-reinvent"
+    pattern-either:
+      - pattern-regex: 'os\.Getenv\("(ANTHROPIC_API_KEY|OPENAI_API_KEY|GOOGLE_API_KEY|ANTHROPIC_AUTH_TOKEN)"\)'
+      - pattern: keyring.Get($SERVICE, $USER)
+
+  - id: sageox-cli.secret-handling.token-in-log
+    severity: WARNING
+    languages: [go]
+    message: |
+      Apparent token / key value passed to a log function. Even structured
+      logs leak — redact at the source.
+    metadata:
+      class: secret-or-token-handling
+      sageox_threat: "security/SECURITY.md#secret-handling-primitives-use-these-dont-reinvent"
+    pattern-either:
+      - pattern: log.Printf($FMT, ..., $TOKEN, ...)
+      - pattern: slog.Info($MSG, ..., "token", $TOKEN, ...)
+      - pattern: slog.Info($MSG, ..., "api_key", $TOKEN, ...)
+    metavariable-regex:
+      metavariable: $TOKEN
+      # case-insensitive so camelCase identifiers like apiKey, authToken,
+      # sessionKey are caught alongside snake_case and lowercase variants
+      regex: '(?i)(token|secret|password|credential|api[_-]?key|auth[_-]?key)'

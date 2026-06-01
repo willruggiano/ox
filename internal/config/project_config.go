@@ -142,6 +142,11 @@ type ProjectConfig struct {
 	// Values: "enabled" (default), "disabled"
 	GitHubSyncIssues string `json:"github_sync_issues,omitempty"`
 
+	// Hooks holds per-hook-event policy switches that may be set at the
+	// repo level to override the user default (or set policy for repos
+	// the user hasn't personally configured). See HooksConfig.
+	Hooks *HooksConfig `json:"hooks,omitempty" yaml:"hooks,omitempty"`
+
 	// KBID is the immutable knowledge-bubble identifier this project is bound
 	// to (ADR-017). Populated when the project has been migrated to the new
 	// .sageox/config.yaml format. Empty for legacy JSON-only projects that

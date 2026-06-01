@@ -9,11 +9,15 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/blevesearch/bleve/v2"
+	"github.com/blevesearch/bleve/v2/mapping"
+	lru "github.com/hashicorp/golang-lru/v2"
 	codedbsqlc "github.com/sageox/ox/internal/codedb/sqlc"
 	"go.etcd.io/bbolt"
 	_ "modernc.org/sqlite"
@@ -144,6 +148,18 @@ type Store struct {
 	// dirty overlays for uncommitted worktree files (keyed by worktree ID)
 	dirtyCodeIndexes  map[string]bleve.Index
 	CombinedCodeIndex bleve.Index // alias of CodeIndex + all dirty indexes, or just CodeIndex
+
+	// blob-read pool — lazy-initialized on first ReadBlob call (search read path).
+	// Per-repo mutex serializes packfile reads (go-git's packfile reader isn't
+	// safe for concurrent access from the same handle). See blob_reader.go.
+	blobReposOnce sync.Once
+	blobRepos     []blobRepoHandle
+
+	// diff snippet cache — lazy-initialized on first DiffSnippet call.
+	// LRU dedupes per-(old_hash, new_hash, path) recomputation of the
+	// indexer-format diff text during search. See diff_snippet.go.
+	diffCacheOnce sync.Once
+	diffCache     *lru.Cache[string, string]
 }
 
 // Open opens (or creates) a Store at the given root directory.
@@ -244,6 +260,123 @@ func openSQLite(root string) (*sql.DB, error) {
 	return db, nil
 }
 
+// bleveMappingFor returns the bleve index mapping for a sub-index.
+//
+// Per ADR-018, the `code` and `comment` indexes use **index-only** content
+// fields (`Store=false`, `IncludeTermVectors=false`): the inverted index — and
+// thus full-text search — is unchanged, but the redundant stored copy of the
+// source text that existed only to produce ANSI highlight fragments is gone.
+// Comment text is still retrievable in full from SQLite (`comments.text`);
+// code snippets are re-derived from git blobs at search time.
+//
+// The `diff` index is also index-only (ADR-018 phase 2 — Option D + Option A):
+// diff text is regenerated on the search read path via Store.DiffSnippet
+// (LRU-cached, using the shared internal/codedb/diffformat package so the
+// indexer's write format and the search re-derivation stay byte-stable).
+//
+// Bump bleveMappingVersion(name) whenever this returns a structurally different
+// mapping; existing on-disk indexes whose stored version is older will be nuked
+// and recreated via the existing self-heal path (and the daemon's
+// `.needs_reindex_<name>` marker triggers a full rebuild on the next pass).
+func bleveMappingFor(name string) mapping.IndexMapping {
+	m := bleve.NewIndexMapping()
+	switch name {
+	case "code", "comment", "diff":
+		// ADR-018 phase 2 added "diff" to the index-only set per Option D
+		// (drop diff snippet; agents `git show` for the patch). Inverted index
+		// is unchanged — diff search keeps working; only the stored copy of
+		// the patch text (used previously for ANSI fragments) goes away.
+		ft := bleve.NewTextFieldMapping()
+		ft.Store = false
+		ft.IncludeTermVectors = false
+		dm := bleve.NewDocumentMapping()
+		dm.AddFieldMappingsAt("content", ft)
+		m.DefaultMapping = dm
+	}
+	return m
+}
+
+// bleveMappingVersion is the structural version of bleveMappingFor(name).
+// Bump when changing Store / IncludeTermVectors / field set.
+func bleveMappingVersion(name string) int {
+	switch name {
+	case "code", "comment":
+		return 2 // ADR-018 phase 1: index-only (was 1 = default stored)
+	case "diff":
+		return 2 // ADR-018 phase 2: index-only Option D (was 1)
+	}
+	return 1
+}
+
+// mappingVersionMarker is the per-sub-index file recording the structural
+// version of the mapping the index was created with. Missing => v1 (pre-marker).
+const mappingVersionMarker = ".mapping_version"
+
+// readMappingVersion returns the recorded mapping version for path. Missing
+// marker (os.IsNotExist) is the legitimate pre-v2 case → returns (1, nil) and
+// the caller may proceed with a destructive upgrade. Any other I/O failure
+// (permission, transient EIO, EROFS) returns (0, err); callers MUST refuse to
+// upgrade on a non-nil error so a transient read failure can't trigger a
+// destructive nuke-and-recreate of a healthy index. Garbage marker contents
+// are treated as pre-marker (v1, no error) — that case is recoverable.
+func readMappingVersion(path string) (int, error) {
+	b, err := os.ReadFile(filepath.Join(path, mappingVersionMarker))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 1, nil
+		}
+		return 0, fmt.Errorf("read mapping version at %s: %w", path, err)
+	}
+	n, parseErr := strconv.Atoi(strings.TrimSpace(string(b)))
+	if parseErr != nil || n < 1 {
+		return 1, nil
+	}
+	return n, nil
+}
+
+func writeMappingVersion(path, name string) error {
+	return os.WriteFile(
+		filepath.Join(path, mappingVersionMarker),
+		[]byte(strconv.Itoa(bleveMappingVersion(name))),
+		0o644,
+	)
+}
+
+// createBleveSubIndex creates a fresh bleve sub-index using the ADR-018 mapping
+// for `name`, then writes the mapping-version marker. Used both for first-time
+// creation and post-rebuild recreation.
+func createBleveSubIndex(path, name string) (bleve.Index, error) {
+	idx, err := bleve.New(path, bleveMappingFor(name))
+	if err != nil {
+		return nil, err
+	}
+	if err := writeMappingVersion(path, name); err != nil {
+		slog.Warn("failed to write bleve mapping version marker",
+			"name", name, "path", path, "err", err)
+	}
+	return idx, nil
+}
+
+// upgradeBleveSubIndex nukes an out-of-date sub-index and recreates it empty
+// under the current mapping, then writes `.needs_reindex_<name>` so the
+// daemon's next pass does a full rebuild via the established self-heal path.
+func upgradeBleveSubIndex(root, path, name string, fromVersion int) (bleve.Index, error) {
+	slog.Info("bleve mapping version upgrade, rebuilding",
+		"name", name, "from", fromVersion, "to", bleveMappingVersion(name))
+	if err := os.RemoveAll(path); err != nil {
+		return nil, fmt.Errorf("remove out-of-date bleve sub-index %s: %w", path, err)
+	}
+	idx, err := createBleveSubIndex(path, name)
+	if err != nil {
+		return nil, fmt.Errorf("recreate bleve sub-index %s: %w", path, err)
+	}
+	if err := WriteNeedsReindexMarker(root, name); err != nil {
+		slog.Warn("failed to write needs_reindex marker after mapping upgrade",
+			"name", name, "err", err)
+	}
+	return idx, nil
+}
+
 // openBleveIndexes opens (or self-heals + recreates) the three bleve
 // sub-indexes. Returns all three on success; closes any successfully opened
 // indexes if a later one fails.
@@ -280,6 +413,7 @@ func (s *Store) Close() error {
 	var firstErr error
 	s.closeOnce.Do(func() {
 		s.DetachDirtyOverlay()
+		s.closeBlobRepos()
 		for _, idx := range []bleve.Index{s.CodeIndex, s.DiffIndex, s.CommentIndex} {
 			if idx == nil {
 				continue
@@ -395,20 +529,95 @@ func (s *Store) CheckIntegrity() error {
 		return fmt.Errorf("sqlite: %w", ErrCorrupt)
 	}
 
-	// validate bleve indexes can serve a basic query (skip nil indexes for
-	// SQL-only stores — those legitimately have no bleve to check)
+	// Probe each bleve sub-index with the FST-touching field walk from PR #607.
+	// Skip nil indexes — a SQL-only store (OpenSQLOnly) legitimately has no
+	// bleve to check, and calling probeBleveIndex on nil would nil-deref before
+	// the recover could catch it.
 	for name, idx := range map[string]bleve.Index{"code": s.CodeIndex, "diff": s.DiffIndex, "comment": s.CommentIndex} {
 		if idx == nil {
 			continue
 		}
-		q := bleve.NewMatchNoneQuery()
-		req := bleve.NewSearchRequest(q)
-		req.Size = 0
-		if _, err := idx.Search(req); err != nil {
-			return fmt.Errorf("bleve %s index: %w", name, ErrCorrupt)
+		if err := probeBleveIndex(idx, name); err != nil {
+			return err
 		}
 	}
 
+	return nil
+}
+
+// probeBleveIndex runs an FST-touching probe against every indexed field
+// and reports ErrCorrupt if the FST cannot be loaded or the probe panics.
+//
+// What this probes: each indexed field has a term dictionary backed by a
+// vellum FST (Finite State Transducer) per segment. Partial-write disk
+// corruption can leave a segment whose FST bytes are unloadable — the
+// failure mode that wedges the daemon when the next batch write hits it.
+//
+// Strategy: get the raw IndexReader via Advanced() and call
+// TermFieldReader(field) directly for every field returned by Fields().
+// TermFieldReader iterates segments and calls segment.Dictionary(field)
+// inline on the calling goroutine, so each field's vellum.Load runs where
+// runBleveProbe's recover can catch a panic.
+//
+// Why not Document / FieldDict / MatchAll / MatchNone:
+//   - MatchNone short-circuits with no segment work at all.
+//   - MatchAll in scorch is served from the live-docs bitmap via
+//     DocIDReaderAll(), bypassing the FST.
+//   - FieldDict in scorch spawns one goroutine per segment for the
+//     Dictionary(field) call (see
+//     scorch.IndexSnapshot.newIndexSnapshotFieldDict). A panic in any of
+//     those goroutines escapes the recover in runBleveProbe and crashes
+//     the process.
+//   - Document(id) only loads the "_id" dictionary, so a corrupt FST on
+//     the searchable content field (where most ox queries land) would
+//     pass.
+//
+// Scope: catches FST loading failures (corrupt vellum bytes, bad dict
+// offsets) for every field in the index. The narrower "segment marks
+// field present but dictStart==0, fst is nil" pattern only panics during
+// write-path DocNumbers calls — that path is covered by safeBatch in
+// internal/codedb/index.
+func probeBleveIndex(idx bleve.Index, name string) error {
+	return runBleveProbe(name, func() error {
+		fields, err := idx.Fields()
+		if err != nil {
+			return err
+		}
+		adv, err := idx.Advanced()
+		if err != nil {
+			return err
+		}
+		reader, err := adv.Reader()
+		if err != nil {
+			return err
+		}
+		defer reader.Close()
+
+		probeTerm := []byte("__sageox_codedb_integrity_probe__")
+		for _, field := range fields {
+			tfr, tfrErr := reader.TermFieldReader(context.Background(), probeTerm, field, false, false, false)
+			if tfrErr != nil {
+				return tfrErr
+			}
+			_ = tfr.Close()
+		}
+		return nil
+	})
+}
+
+// runBleveProbe wraps a probe function with the panic-recovery and
+// ErrCorrupt-wrapping policy used by CheckIntegrity. Factored out so the
+// recovery contract can be tested without stubbing the whole bleve.Index
+// interface.
+func runBleveProbe(name string, probe func() error) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("bleve %s index: panic during FST probe (%v): %w", name, r, ErrCorrupt)
+		}
+	}()
+	if sErr := probe(); sErr != nil {
+		return fmt.Errorf("bleve %s index: %w", name, errors.Join(ErrCorrupt, sErr))
+	}
 	return nil
 }
 
@@ -454,11 +663,30 @@ func removeSQLiteFiles(dbPath string) {
 func openOrCreateBleveIndex(root, path, name string) (bleve.Index, error) {
 	idx, err := safeOpenBleve(path)
 	if err == nil {
+		// Mapping-version check: an existing index opened cleanly, but if its
+		// mapping version is below the current one (e.g., ADR-018 flipped code
+		// from default-stored to index-only), it must be rebuilt — the old
+		// stored segments don't shrink in place. On a transient marker-read
+		// failure (permission, I/O), keep the existing index rather than
+		// destructively rebuild — a flaky filesystem must not nuke a healthy
+		// bleve dir.
+		got, verErr := readMappingVersion(path)
+		if verErr != nil {
+			slog.Warn("read mapping version failed; keeping existing index (no destructive upgrade)",
+				"name", name, "path", path, "err", verErr)
+			return idx, nil
+		}
+		if got < bleveMappingVersion(name) {
+			if closeErr := idx.Close(); closeErr != nil {
+				slog.Warn("close before mapping upgrade failed",
+					"name", name, "err", closeErr)
+			}
+			return upgradeBleveSubIndex(root, path, name, got)
+		}
 		return idx, nil
 	}
 	if errors.Is(err, bleve.ErrorIndexPathDoesNotExist) {
-		mapping := bleve.NewIndexMapping()
-		return bleve.New(path, mapping)
+		return createBleveSubIndex(path, name)
 	}
 
 	// Before treating as corruption, check if the bbolt file exists.
@@ -491,8 +719,7 @@ func openOrCreateBleveIndex(root, path, name string) (bleve.Index, error) {
 	if removeErr := os.RemoveAll(path); removeErr != nil {
 		return nil, fmt.Errorf("remove corrupt bleve index %s: %w", path, removeErr)
 	}
-	mapping := bleve.NewIndexMapping()
-	return bleve.New(path, mapping)
+	return createBleveSubIndex(path, name)
 }
 
 // selfHealBleveSubIndex recovers from proven mapping/snapshot corruption by
@@ -512,8 +739,7 @@ func selfHealBleveSubIndex(root, path, name string, openErr error) (bleve.Index,
 	if removeErr := os.RemoveAll(path); removeErr != nil {
 		return nil, fmt.Errorf("remove corrupt bleve sub-index %s: %w", path, removeErr)
 	}
-	mapping := bleve.NewIndexMapping()
-	idx, err := bleve.New(path, mapping)
+	idx, err := createBleveSubIndex(path, name)
 	if err != nil {
 		return nil, fmt.Errorf("recreate empty bleve sub-index %s: %w", path, err)
 	}
@@ -713,8 +939,7 @@ func RebuildBleveSubIndex(root, name string) error {
 	if err := os.RemoveAll(bleveDir); err != nil {
 		return fmt.Errorf("remove %s bleve dir: %w", name, err)
 	}
-	mapping := bleve.NewIndexMapping()
-	idx, err := bleve.New(bleveDir, mapping)
+	idx, err := createBleveSubIndex(bleveDir, name)
 	if err != nil {
 		return fmt.Errorf("recreate %s bleve index: %w", name, err)
 	}

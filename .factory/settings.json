@@ -1,0 +1,34 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "if command -v ox \u003e/dev/null 2\u003e\u00261; then AGENT_ENV=droid ox agent hook PostToolUse 2\u003e\u00261 || true; fi",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "if command -v ox \u003e/dev/null 2\u003e\u00261; then AGENT_ENV=droid ox agent hook PreToolUse 2\u003e\u00261 || true; fi",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "if command -v ox \u003e/dev/null 2\u003e\u00261; then AGENT_ENV=droid ox agent hook Stop 2\u003e\u00261 || true; fi",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

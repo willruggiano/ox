@@ -28,6 +28,7 @@ import (
 	"github.com/go-git/go-git/v6/utils/merkletrie"
 
 	"github.com/sageox/ox/internal/codedb/comments"
+	"github.com/sageox/ox/internal/codedb/diffformat"
 	"github.com/sageox/ox/internal/codedb/language"
 	codedbsqlc "github.com/sageox/ox/internal/codedb/sqlc"
 	"github.com/sageox/ox/internal/codedb/store"
@@ -132,7 +133,7 @@ func (st *indexState) flushCodeBatch(force bool) error {
 	if !force && st.codeBatchN < bleveBatchSize {
 		return nil
 	}
-	if err := st.store.CodeIndex.Batch(st.codeBatch); err != nil {
+	if err := safeBatch(func() error { return st.store.CodeIndex.Batch(st.codeBatch) }); err != nil {
 		return fmt.Errorf("flush code batch: %w", err)
 	}
 	st.codeBatch = st.store.CodeIndex.NewBatch()
@@ -152,7 +153,7 @@ func (st *indexState) flushDiffBatch(force bool) error {
 	if !force && st.diffBatchN < bleveBatchSize {
 		return nil
 	}
-	if err := st.store.DiffIndex.Batch(st.diffBatch); err != nil {
+	if err := safeBatch(func() error { return st.store.DiffIndex.Batch(st.diffBatch) }); err != nil {
 		st.diffIndexFailed = true
 		slog.Warn("codedb: diff index write failed, type:diff search will be incomplete for this run", "err", err)
 		st.diffBatch = st.store.DiffIndex.NewBatch()
@@ -307,6 +308,13 @@ func IndexRepo(ctx context.Context, s *store.Store, url string, opts IndexOption
 // IndexLocalRepo indexes a local git repository in-place (no clone).
 // It indexes all committed history AND the current working tree, including
 // uncommitted (dirty) files.
+//
+// Returns ErrAlternatesUnsupported when the repo has
+// `.git/objects/info/alternates` configured. go-git v6 does not honor
+// alternates (see TestPlainOpenTolerant_AlternatesUpstreamLimitation), so
+// blob and commit reads would silently fail mid-walk. Callers should
+// treat this as a soft-skip (codedb indexing unavailable for this repo)
+// rather than a fatal error.
 func IndexLocalRepo(ctx context.Context, s *store.Store, localPath string, opts IndexOptions) error {
 	report := func(msg string) {
 		if opts.Progress != nil {
@@ -320,6 +328,14 @@ func IndexLocalRepo(ctx context.Context, s *store.Store, localPath string, opts 
 	// go-git can access the shared object store (packfiles, loose objects).
 	report("Opening local repository...")
 	repoOpenPath, isWorktree := resolveGitDir(localPath)
+
+	// Gate on alternates BEFORE plainOpenTolerant: go-git v6 silently
+	// returns "object not found" later in the walk, which surfaces as
+	// confusing partial-index failures rather than the actual root cause.
+	if hasAlternates(repoOpenPath) {
+		return fmt.Errorf("codedb cannot index %s: %w", localPath, ErrAlternatesUnsupported)
+	}
+
 	repo, err := plainOpenTolerant(repoOpenPath)
 	if err != nil {
 		return fmt.Errorf("open local repo %s: %w", localPath, err)
@@ -477,7 +493,7 @@ func BuildDirtyIndex(ctx context.Context, localPath, dirtyPath string, opts Inde
 	}
 
 	if indexed > 0 {
-		if err := dirtyIdx.Batch(batch); err != nil {
+		if err := safeBatch(func() error { return dirtyIdx.Batch(batch) }); err != nil {
 			dirtyIdx.Close()
 			_ = os.RemoveAll(tmpPath)
 			return 0, fmt.Errorf("batch dirty index: %w", err)
@@ -1302,54 +1318,21 @@ func (st *indexState) ensureBlob(blobOID plumbing.Hash, path string) (int64, str
 // oldText/newText are pre-read blob contents from ensureBlob; when non-empty they
 // avoid a redundant git object read (saves one BlobObject+ReadAll per side).
 func generateDiffText(repo *git.Repository, path string, oldOID, newOID plumbing.Hash, hasOld, hasNew bool, oldText, newText string) string {
-	const maxLines = 100
-
-	var b strings.Builder
-	b.WriteString("--- a/")
-	b.WriteString(path)
-	b.WriteByte('\n')
-	b.WriteString("+++ b/")
-	b.WriteString(path)
-	b.WriteByte('\n')
-
-	if hasOld && oldOID != (plumbing.Hash{}) {
-		if oldText == "" {
-			oldText = readBlobText(repo, oldOID)
-		}
-		if oldText != "" {
-			writePrefixedLines(&b, oldText, '-', maxLines)
-		}
+	if hasOld && oldOID != (plumbing.Hash{}) && oldText == "" {
+		oldText = readBlobText(repo, oldOID)
 	}
-
-	if hasNew && newOID != (plumbing.Hash{}) {
-		if newText == "" {
-			newText = readBlobText(repo, newOID)
-		}
-		if newText != "" {
-			writePrefixedLines(&b, newText, '+', maxLines)
-		}
+	if hasNew && newOID != (plumbing.Hash{}) && newText == "" {
+		newText = readBlobText(repo, newOID)
 	}
-
-	return b.String()
-}
-
-// writePrefixedLines writes up to maxLines lines from text into b, each prefixed with prefix.
-// Replaces strings.SplitN (allocates []string) + fmt.Fprintf per line (allocs per call):
-// before: 317 allocs/op, ~130-184µs; after: 114 allocs/op, ~93-106µs (-64% allocs, -30% time).
-func writePrefixedLines(b *strings.Builder, text string, prefix byte, maxLines int) {
-	for remaining := maxLines; remaining > 0 && text != ""; remaining-- {
-		var line string
-		if idx := strings.IndexByte(text, '\n'); idx >= 0 {
-			line = text[:idx]
-			text = text[idx+1:]
-		} else {
-			line = text
-			text = ""
-		}
-		b.WriteByte(prefix)
-		b.WriteString(line)
-		b.WriteByte('\n')
+	if !hasOld {
+		oldText = ""
 	}
+	if !hasNew {
+		newText = ""
+	}
+	// Shared with search read-path's diff snippet re-derivation; must stay
+	// byte-stable across both call sites (ADR-018 phase 2 Option A).
+	return diffformat.Format(path, oldText, newText)
 }
 
 // readBlobText reads a blob's content as a string, returning "" if unreadable or binary.
@@ -1665,14 +1648,9 @@ func ParseSymbols(ctx context.Context, s *store.Store, progress ProgressFunc) (P
 		return stats, fmt.Errorf("query unparsed blobs: %w", err)
 	}
 
-	type blobRow struct {
-		id          int64
-		contentHash string
-		language    string
-	}
-	var blobs []blobRow
+	var blobs []parseBlobRow
 	for rows.Next() {
-		var b blobRow
+		var b parseBlobRow
 		if err := rows.Scan(&b.id, &b.contentHash, &b.language); err != nil {
 			rows.Close()
 			return stats, fmt.Errorf("scan blob row: %w", err)
@@ -1697,7 +1675,11 @@ func ParseSymbols(ctx context.Context, s *store.Store, progress ProgressFunc) (P
 		}
 	}()
 
-	// Prefetch all blob content in parallel
+	// Prefetch all blob content in parallel. Symbol extraction is serial and
+	// transient (per-blob garbage is GC'd quickly), so chunking the prefetch
+	// only adds per-chunk pool churn and measured *higher* peak — the daemon's
+	// tighter GOGC bounds this phase's heap instead. (ParseComments, which holds
+	// all results live, IS chunked.)
 	hashes := make([]string, len(blobs))
 	for i, b := range blobs {
 		hashes[i] = b.contentHash
@@ -1840,6 +1822,19 @@ func ParseSymbols(ctx context.Context, s *store.Store, progress ProgressFunc) (P
 	return stats, nil
 }
 
+// parseBlobRow is a tip blob queued for comment extraction.
+type parseBlobRow struct {
+	id          int64
+	contentHash string
+	language    string
+}
+
+// parseChunkSize bounds how many blobs ParseComments prefetches and holds in its
+// result set per transaction, so peak memory is proportional to one chunk rather
+// than the whole repo (which previously prefetched + held every tip blob's
+// comments at once).
+const parseChunkSize = 512
+
 // CommentStats holds statistics from the comment parsing phase.
 type CommentStats struct {
 	BlobsParsed       uint64
@@ -1894,14 +1889,9 @@ func ParseComments(ctx context.Context, s *store.Store, progress ProgressFunc) (
 		return stats, fmt.Errorf("query unparsed blobs: %w", err)
 	}
 
-	type blobRow struct {
-		id          int64
-		contentHash string
-		language    string
-	}
-	var blobs []blobRow
+	var blobs []parseBlobRow
 	for rows.Next() {
-		var b blobRow
+		var b parseBlobRow
 		if err := rows.Scan(&b.id, &b.contentHash, &b.language); err != nil {
 			rows.Close()
 			return stats, fmt.Errorf("scan blob row: %w", err)
@@ -1926,30 +1916,56 @@ func ParseComments(ctx context.Context, s *store.Store, progress ProgressFunc) (
 		}
 	}()
 
-	// Prefetch all blob content in parallel
-	hashes := make([]string, len(blobs))
-	for i, b := range blobs {
+	// Process in chunks so prefetched content, the extraction result set, and
+	// the open transaction stay bounded regardless of repo size.
+	for start := 0; start < len(blobs); start += parseChunkSize {
+		end := start + parseChunkSize
+		if end > len(blobs) {
+			end = len(blobs)
+		}
+		bp, ce, err := processCommentChunk(ctx, s, repos, repoPaths, blobs[start:end], report)
+		stats.BlobsParsed += bp
+		stats.CommentsExtracted += ce
+		if err != nil {
+			return stats, err
+		}
+		report(fmt.Sprintf("Parsing comments: %d/%d blobs...", end, len(blobs)))
+	}
+
+	report(fmt.Sprintf("Comment parsing complete: %d blobs parsed, %d comments extracted.",
+		stats.BlobsParsed, stats.CommentsExtracted))
+
+	return stats, nil
+}
+
+// processCommentChunk extracts and inserts comments for one chunk of blobs.
+// Extraction runs in parallel (comments.Extract is a stateless rune scanner,
+// unlike gotreesitter); a single-writer phase then inserts in one transaction.
+// Counts are returned only on a successful commit; on error the chunk's
+// transaction rolls back and (0,0,err) is returned.
+func processCommentChunk(ctx context.Context, s *store.Store, repos []*git.Repository, repoPaths []string, chunk []parseBlobRow, report func(string)) (blobsParsed, commentsExtracted uint64, err error) {
+	const maxCommentsPerBlob = 1000
+	const maxBlobSize = 1 << 20 // 1MB
+	const commentSQLBatchSize = 100
+
+	hashes := make([]string, len(chunk))
+	for i, b := range chunk {
 		hashes[i] = b.contentHash
 	}
 	blobCache := prefetchBlobContents(ctx, repos, repoPaths, hashes, report)
-	report(fmt.Sprintf("  prefetched %d/%d blobs", len(blobCache), len(blobs)))
 
-	const maxCommentsPerBlob = 1000
-	const maxBlobSize = 1 << 20 // 1MB
-
-	// Phase 2: Extract comments in parallel
+	// Phase 1: extract comments in parallel.
 	workers := runtime.GOMAXPROCS(0)
-	if workers > len(blobs) {
-		workers = len(blobs)
+	if workers > len(chunk) {
+		workers = len(chunk)
 	}
 	if workers < 1 {
 		workers = 1
 	}
 
-	results := make([]commentResult, len(blobs))
+	results := make([]commentResult, len(chunk))
 	var wg sync.WaitGroup
 	ch := make(chan int, workers*2)
-	var extracted atomic.Int64
 
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
@@ -1959,7 +1975,7 @@ func ParseComments(ctx context.Context, s *store.Store, progress ProgressFunc) (
 				if ctx.Err() != nil {
 					return
 				}
-				blob := blobs[idx]
+				blob := chunk[idx]
 				content, ok := blobCache[blob.contentHash]
 				if !ok {
 					results[idx] = commentResult{blobID: blob.id, miss: true}
@@ -1972,16 +1988,12 @@ func ParseComments(ctx context.Context, s *store.Store, progress ProgressFunc) (
 					}
 					results[idx] = commentResult{blobID: blob.id, comments: cms}
 				}
-				n := extracted.Add(1)
-				if n%500 == 0 {
-					report(fmt.Sprintf("  extracting comments: %d/%d blobs...", n, len(blobs)))
-				}
 			}
 		}()
 	}
 
 sendLoop2:
-	for i := range blobs {
+	for i := range chunk {
 		select {
 		case <-ctx.Done():
 			break sendLoop2
@@ -1992,30 +2004,26 @@ sendLoop2:
 	wg.Wait()
 
 	if err := ctx.Err(); err != nil {
-		return stats, err
+		return 0, 0, err
 	}
 
-	// Free blob cache before SQL phase to reduce memory pressure
+	// Free blob cache before the SQL phase to reduce memory pressure.
 	blobCache = nil
 
-	// Phase 3: Single-writer SQL + Bleve insertion with batched INSERTs
+	// Phase 2: single-writer SQL + Bleve insertion with batched INSERTs.
 	tx, err := s.Begin()
 	if err != nil {
-		return stats, fmt.Errorf("begin transaction: %w", err)
+		return 0, 0, fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
 	txq := codedbsqlc.New(tx)
 	commentBatch := s.CommentIndex.NewBatch()
 	commentBatchN := 0
-	const commentSQLBatchSize = 100
 
-	for i, result := range results {
+	for _, result := range results {
 		if err := ctx.Err(); err != nil {
-			return stats, err
-		}
-		if (i+1)%500 == 0 {
-			report(fmt.Sprintf("  inserting comments: %d/%d blobs...", i+1, len(results)))
+			return 0, 0, err
 		}
 
 		if result.miss {
@@ -2027,7 +2035,7 @@ sendLoop2:
 				slog.Warn("mark blob comments_parsed", "blob_id", result.blobID, "err", err)
 			}
 			if !result.skip {
-				stats.BlobsParsed++
+				blobsParsed++
 			}
 			continue
 		}
@@ -2054,61 +2062,59 @@ sendLoop2:
 			sb.WriteString(" RETURNING id")
 			rows, err := tx.Query(sb.String(), sqlArgs...)
 			if err != nil {
-				return stats, fmt.Errorf("batch insert comments: %w", err)
+				return 0, 0, fmt.Errorf("batch insert comments: %w", err)
 			}
 			cmIdx := 0
 			for rows.Next() {
 				var commentID int64
 				if err := rows.Scan(&commentID); err != nil {
 					rows.Close()
-					return stats, fmt.Errorf("scan inserted comment id: %w", err)
+					return 0, 0, fmt.Errorf("scan inserted comment id: %w", err)
 				}
 				if cmIdx < len(batch) {
 					commentBatch.Index("comment_"+strconv.FormatInt(commentID, 10), BleveCommentDoc{Content: batch[cmIdx].Text})
 				}
 				cmIdx++
 				commentBatchN++
-				stats.CommentsExtracted++
+				commentsExtracted++
 
-				if commentBatchN >= bleveBatchSize {
-					if err := s.CommentIndex.Batch(commentBatch); err != nil {
-						rows.Close()
-						return stats, fmt.Errorf("flush comment batch: %w", err)
-					}
-					commentBatch = s.CommentIndex.NewBatch()
-					commentBatchN = 0
-				}
+				// NOTE: do NOT flush bleve here mid-tx. If the SQL tx later rolls
+				// back, any already-flushed bleve docs become orphans (pointing
+				// to comment ids that don't exist post-rollback). Per-chunk
+				// bounds keep the in-memory batch reasonable; the single
+				// safeBatch flush after the tx commits below is the only
+				// commit point — safeBatch recovers panics from corrupt FST
+				// segments (per PR #607) so the deferred tx.Rollback can run
+				// without deadlocking on the bbolt lock the panicked Batch
+				// would otherwise still hold.
 			}
 			if err := rows.Err(); err != nil {
 				rows.Close()
-				return stats, fmt.Errorf("iterate inserted comment ids: %w", err)
+				return 0, 0, fmt.Errorf("iterate inserted comment ids: %w", err)
 			}
 			rows.Close()
 			if cmIdx != len(batch) {
-				return stats, fmt.Errorf("comments batch: expected %d returned ids, got %d", len(batch), cmIdx)
+				return 0, 0, fmt.Errorf("comments batch: expected %d returned ids, got %d", len(batch), cmIdx)
 			}
 		}
 
 		if err := txq.MarkBlobCommentsParsed(ctx, result.blobID); err != nil {
-			return stats, fmt.Errorf("mark blob comments_parsed: %w", err)
+			return 0, 0, fmt.Errorf("mark blob comments_parsed: %w", err)
 		}
 
-		stats.BlobsParsed++
+		blobsParsed++
 	}
 
 	if err := tx.Commit(); err != nil {
-		return stats, fmt.Errorf("commit transaction: %w", err)
+		return 0, 0, fmt.Errorf("commit transaction: %w", err)
 	}
 
 	// flush remaining bleve batch after SQL commit
 	if commentBatchN > 0 {
-		if err := s.CommentIndex.Batch(commentBatch); err != nil {
-			return stats, fmt.Errorf("flush final comment batch: %w", err)
+		if err := safeBatch(func() error { return s.CommentIndex.Batch(commentBatch) }); err != nil {
+			return 0, 0, fmt.Errorf("flush final comment batch: %w", err)
 		}
 	}
 
-	report(fmt.Sprintf("Comment parsing complete: %d blobs parsed, %d comments extracted.",
-		stats.BlobsParsed, stats.CommentsExtracted))
-
-	return stats, nil
+	return blobsParsed, commentsExtracted, nil
 }
