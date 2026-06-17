@@ -1007,66 +1007,6 @@ func (st *indexState) insertParentLinks(commitDBID int64, parentIDs []plumbing.H
 	return nil
 }
 
-// indexChangedFiles processes files that were added or modified in a commit.
-func (st *indexState) indexChangedFiles(commitDBID int64, childEntries, parentEntries map[string]plumbing.Hash) error {
-	for path, childBlobOID := range childEntries {
-		parentBlobOID, existsInParent := parentEntries[path]
-		if existsInParent && parentBlobOID == childBlobOID {
-			continue // unchanged
-		}
-
-		// ensureBlob returns the content it read for Bleve; reuse it in generateDiffText
-		// to avoid reading the same git object twice per changed file.
-		newBlobDBID, newText, indexed, err := st.ensureBlob(childBlobOID, path)
-		if err != nil {
-			return err
-		}
-		if indexed {
-			st.newBlobs++
-		}
-
-		var oldBlobDBID sql.NullInt64
-		var oldText string
-		if existsInParent {
-			id, text, idx, err := st.ensureBlob(parentBlobOID, path)
-			if err != nil {
-				return err
-			}
-			if idx {
-				st.newBlobs++
-			}
-			oldBlobDBID = sql.NullInt64{Int64: id, Valid: true}
-			oldText = text
-		}
-
-		if err := st.insertDiff(commitDBID, path, oldBlobDBID, newBlobDBID, parentBlobOID, childBlobOID, existsInParent, true, oldText, newText); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// indexDeletedFiles processes files that were removed in a commit.
-func (st *indexState) indexDeletedFiles(commitDBID int64, childEntries, parentEntries map[string]plumbing.Hash) error {
-	for path, parentBlobOID := range parentEntries {
-		if _, exists := childEntries[path]; exists {
-			continue
-		}
-		oldBlobDBID, oldText, indexed, err := st.ensureBlob(parentBlobOID, path)
-		if err != nil {
-			return err
-		}
-		if indexed {
-			st.newBlobs++
-		}
-
-		if err := st.insertDiff(commitDBID, path, sql.NullInt64{Int64: oldBlobDBID, Valid: true}, 0, parentBlobOID, plumbing.ZeroHash, true, false, oldText, ""); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // indexChangeEntry processes one added or modified file from a DiffTree change.
 // hasOld=false for insertions (initial commit or new file); hasOld=true for modifications.
 func (st *indexState) indexChangeEntry(commitDBID int64, path string, newOID, oldOID plumbing.Hash, hasOld bool) error {
@@ -1805,6 +1745,21 @@ func ParseSymbols(ctx context.Context, s *store.Store, progress ProgressFunc) (P
 			}
 		}
 
+		// ADR-019 phase 1: resolve same-file edges (caller → callee) using
+		// the in-memory syms/refs we already extracted. Phase 1 is intra-blob
+		// only — cross-file resolution comes in later phases.
+		if err := insertSymbolEdges(tx, blob.id, syms, refs, symDBIDs); err != nil {
+			return stats, fmt.Errorf("insert symbol edges: %w", err)
+		}
+		// Stamp the resolver version on the blob so BackfillSymbolEdges can
+		// distinguish "already at current resolver" from "needs backfill".
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE blobs SET edge_version = ? WHERE id = ?",
+			symbols.ResolverVersion, blob.id,
+		); err != nil {
+			return stats, fmt.Errorf("update blob edge_version: %w", err)
+		}
+
 		if err := txq.MarkBlobParsed(ctx, blob.id); err != nil {
 			return stats, fmt.Errorf("mark blob parsed: %w", err)
 		}
@@ -1820,6 +1775,42 @@ func ParseSymbols(ctx context.Context, s *store.Store, progress ProgressFunc) (P
 		stats.BlobsParsed, stats.SymbolsExtracted))
 
 	return stats, nil
+}
+
+// insertSymbolEdges resolves same-file edges via symbols.Resolve and inserts
+// them in batches. ADR-019 phase 1 only emits intra-blob edges; cross-file
+// resolution comes later. No-op when the resolver returns nothing
+// (refs without same-file matches stay in symbol_refs for the name-fallback path).
+func insertSymbolEdges(tx *sql.Tx, blobID int64, syms []symbols.Symbol, refs []symbols.Ref, symDBIDs []int64) error {
+	edges := symbols.Resolve(syms, refs)
+	if len(edges) == 0 {
+		return nil
+	}
+	const edgeBatchSize = 50
+	for batchStart := 0; batchStart < len(edges); batchStart += edgeBatchSize {
+		batchEnd := min(batchStart+edgeBatchSize, len(edges))
+		batch := edges[batchStart:batchEnd]
+
+		var sb strings.Builder
+		sb.WriteString("INSERT INTO symbol_edges (src_blob_id, src_symbol_id, dst_blob_id, dst_symbol_id, dst_name, kind, confidence, line, col) VALUES ")
+		sqlArgs := make([]interface{}, 0, len(batch)*9)
+		for k, e := range batch {
+			if k > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString("(?,?,?,?,?,?,?,?,?)")
+			// Phase 1: src and dst are both in the same blob.
+			sqlArgs = append(sqlArgs,
+				blobID, symDBIDs[e.SrcIdx],
+				blobID, symDBIDs[e.DstIdx],
+				e.DstName, e.Kind, e.Confidence, e.Line, e.Col,
+			)
+		}
+		if _, err := tx.Exec(sb.String(), sqlArgs...); err != nil {
+			return fmt.Errorf("batch insert symbol edges: %w", err)
+		}
+	}
+	return nil
 }
 
 // parseBlobRow is a tip blob queued for comment extraction.

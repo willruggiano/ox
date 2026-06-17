@@ -223,6 +223,7 @@ func (r *WorkspaceRegistry) rebuildFromConfigLocked(cfg *config.LocalConfig) {
 		existing.Path = cfg.Ledger.Path
 		existing.Endpoint = r.endpoint
 		existing.ConfigLastSync = cfg.Ledger.LastSync
+		existing.LastGCTime = cfg.Ledger.LastGC
 		existing.Exists = gitutil.IsGitRepo(cfg.Ledger.Path)
 
 		// backfill: if repo exists but was never marked as synced, set it now
@@ -279,6 +280,7 @@ func (r *WorkspaceRegistry) rebuildFromConfigLocked(cfg *config.LocalConfig) {
 		existing.Path = tc.Path
 		existing.Endpoint = r.endpoint
 		existing.ConfigLastSync = tc.LastSync
+		existing.LastGCTime = tc.LastGC
 		existing.Exists = tc.Path != "" && gitutil.IsGitRepo(tc.Path)
 
 		// populate clone URL from credentials (match by team ID or name)
@@ -552,13 +554,35 @@ func (r *WorkspaceRegistry) GetGCInterval(path string) int {
 	return 7
 }
 
-// UpdateLastGC records that GC completed for a workspace.
+// UpdateLastGC records that GC completed for a workspace, in both the registry
+// and config.local.toml. Persisting to disk lets the gc_interval_days cadence
+// survive daemon restarts — otherwise every restart zeroes LastGCTime and
+// re-reclones every workspace. Persistence is best-effort (mirrors the GC path's
+// other non-fatal steps); the in-memory update always happens.
 func (r *WorkspaceRegistry) UpdateLastGC(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if ws := r.workspaces[id]; ws != nil {
-		ws.LastGCTime = time.Now()
+	ws := r.workspaces[id]
+	if ws == nil {
+		return
+	}
+	ws.LastGCTime = time.Now()
+
+	// also persist to the config file
+	if r.localConfigCache == nil {
+		return // in-memory only; nothing to persist
+	}
+
+	switch ws.Type {
+	case WorkspaceTypeLedger:
+		r.localConfigCache.UpdateLedgerLastGC()
+	case WorkspaceTypeTeamContext:
+		r.localConfigCache.UpdateTeamContextLastGC(ws.TeamID)
+	}
+
+	if err := config.SaveLocalConfig(r.projectRoot, r.localConfigCache); err != nil {
+		slog.Warn("failed to persist last_gc to config.local.toml", "id", id, "error", err)
 	}
 }
 

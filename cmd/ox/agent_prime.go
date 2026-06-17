@@ -501,8 +501,13 @@ func runAgentPrime(cmd *cobra.Command, args []string) error {
 		doctorHint = "Run 'ox agent doctor' to finalize incomplete sessions" // quote command names in prose for scannability
 	}
 
+	// Surface scheduled agent tasks at prime — the universal delivery channel
+	// (every adapter runs prime at session start). Best-effort and gated on the
+	// queue existing so a read never materializes the directory.
+	agentTasksReady := countReadyAgentTasks(projectRoot, agentType)
+
 	// build intent-to-command guidance for agent consumption
-	guidance := buildGuidance(agentID, projectRoot, teamCtx, ledgerStatus)
+	guidance := buildGuidance(agentID, projectRoot, teamCtx, ledgerStatus, agentType)
 	timing["guidance_build"] = time.Since(phaseStart).Milliseconds()
 
 	// register or update agent instance locally (bootstrap completes without cloud API)
@@ -604,6 +609,7 @@ func runAgentPrime(cmd *cobra.Command, args []string) error {
 		PrimeCallCount:     primeCallCount,
 		NeedsDoctorAgent:   needsDoctorAgent,
 		DoctorHint:         doctorHint,
+		AgentTasksReady:    agentTasksReady,
 		HooksInstalled:     hooksInstalled,
 		CurrentUserName:    currentUserName,
 		CurrentUserAliases: currentUserAliases,
@@ -1057,7 +1063,7 @@ func buildCapturePriorGuidance(agentID string) *capturePriorGuidance {
 // buildGuidance constructs state-aware command guidance for agent consumption.
 // Performs I/O (os.Stat, exec.Command) to resolve repo slug and code DB availability,
 // then delegates to pure prime.BuildGuidance.
-func buildGuidance(agentID, projectRoot string, teamCtx *teamContextInfo, ledgerStatus *ledgerInfo) *agentGuidance {
+func buildGuidance(agentID, projectRoot string, teamCtx *teamContextInfo, ledgerStatus *ledgerInfo, agentType string) *agentGuidance {
 	repoSlug := repoSlugFromRemoteOrDir(projectRoot)
 	codeDBDir := resolveCodeDBDir(projectRoot)
 	_, statErr := os.Stat(codeDBDir)
@@ -1070,6 +1076,7 @@ func buildGuidance(agentID, projectRoot string, teamCtx *teamContextInfo, ledger
 		CodeDBExists:     statErr == nil,
 		MemoryEnabled:    auth.IsMemoryEnabled(),
 		MurmuringEnabled: config.MurmuringEnabled(projectRoot),
+		AgentType:        agentType,
 	})
 }
 

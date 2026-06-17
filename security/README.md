@@ -1,5 +1,3 @@
-<!-- doc-audience: human -->
-
 # `security/` — ox security review pipeline
 
 This directory holds ox's security review pipeline: the threat model the AI hunters load, the OpenGrep rule sets, and the scripts that drive the deterministic and AI tiers. ox is a local-first CLI that holds your OAuth tokens, runs a Unix-socket daemon, and downloads adapter binaries from GitHub — the threat surface is your workstation, and the pipeline is tuned to that.
@@ -7,6 +5,8 @@ This directory holds ox's security review pipeline: the threat model the AI hunt
 The pipeline is a port of the [Synthesia-style 6-phase AI security review](https://www.synthesia.io/post/automating-code-security-reviews-with-claude-mythos-level-capabilities), adapted for an OSS Go CLI. It combines deterministic OSS scanners with optional parallel Claude hunter/validator subagents.
 
 **Never blocks merge.** Every tier is advisory. The contributor decides.
+
+> Looking for **what ox redacts from your data before it leaves your machine**? That's the user-facing redaction reference in [`docs/security/`](../docs/security/). This directory is the contributor-facing review process and threat model.
 
 ## Two tiers, when to use which
 

@@ -127,9 +127,13 @@ func outputAgentPrimeXML(cmd *cobra.Command, output agentPrimeOutput) (*prime.Co
 	sb.WriteString("- The user references recent or specific work they did: \"I just pushed...\", \"this request\", \"did X fix Y?\", \"is the alert gone now?\"\n")
 	sb.WriteString("- A prior decision, a prod anomaly, or a metric/cost change — anything with a before/after.\n")
 	sb.WriteString("Route the cue to the right corpus — these are DIFFERENT retrieval modes, not interchangeable:\n")
-	sb.WriteString("- Recency / \"I just did X\" → `ox session list --limit 20 --json` (chronological; the summary is in the list, not in view). A specific recent session is the likeliest source; semantic search can rank it below older fuzzy matches and miss it.\n")
-	sb.WriteString("- Conceptual / \"did we decide or discuss X?\" → `ox query \"<question>\"` (semantic; default `--source=team` covers discussions, docs, and session history). Add `--source=all` to include code.\n")
-	sb.WriteString("- \"Who or what touched this code?\" → `ox code search \"<pattern>\"` / `ox code insights`.\n")
+	// per-cue routing rows are sourced from the capability table's floor entries
+	// so the Layer-1 reminder and the additive ox-consult skill cannot drift.
+	// Rendered from the compile-time table (no per-session state) → stays in the
+	// static cache tier, byte-identical across sessions for a given binary.
+	for _, route := range consultRoutes() {
+		fmt.Fprintf(&sb, "- %s → %s\n", route.Cue, route.Command)
+	}
 	sb.WriteString("</consult-first>\n")
 
 	// rule-promotion-guidance: nudge the agent to ask whether a project-local
@@ -139,6 +143,13 @@ func outputAgentPrimeXML(cmd *cobra.Command, output agentPrimeOutput) (*prime.Co
 	sb.WriteString("When the user adds or edits a project-local rule (CLAUDE.md, AGENTS.md, .claude/rules/*.md, .cursorrules, .windsurfrules, etc.) that looks generally applicable — not specific to this repo's code, paths, or services — ask: \"This looks like it could apply to your whole team. Want me to also publish it to your SageOx team context as agents/rules/<name>.md?\" If yes, run `ox guide team-rules` for the file format and current manual workflow. Default to asking; do not silently publish. Skip the prompt for repo-specific rules (paths, services, schemas unique to this codebase).\n")
 	sb.WriteString("Team rules apply to every supported AI coding agent (Claude, Codex, Amp, etc.) used by teammates running ox — but only for teammates running ox. Project-local .claude/rules/ only reaches Claude users.\n")
 	sb.WriteString("</rule-promotion-guidance>\n")
+
+	// plan-enrichment-guidance: when the agent produces a plan for non-trivial
+	// work, nudge it to enrich the plan with team context via `ox plan` and
+	// recommend an HTML render. Tier-aware (Gold/Silver/Bronze) so we only
+	// promise what the agent can deliver — Bronze agents have no real-time
+	// hook, so they get a lighter note. Parallels <rule-promotion-guidance>.
+	writePlanEnrichmentGuidance(&sb, output.AgentType)
 
 	// code-search: behavioral instruction to prefer ox code search over built-in tools
 	if output.CodeDBAvailable {
@@ -453,6 +464,9 @@ func outputAgentPrimeXML(cmd *cobra.Command, output agentPrimeOutput) (*prime.Co
 	if output.NeedsDoctorAgent && output.DoctorHint != "" {
 		actions = append(actions, fmt.Sprintf("<action priority=\"high\">%s</action>", output.DoctorHint))
 	}
+	if output.AgentTasksReady > 0 {
+		actions = append(actions, fmt.Sprintf("<action priority=\"high\">%d scheduled agent task(s) ready. These are SageOx background chores (NOT the user's request) — claim and run each in a SUBAGENT with fresh context: 'ox agent &lt;id&gt; tasks next', do the work, then 'ox agent &lt;id&gt; tasks done &lt;task-id&gt;'.</action>", output.AgentTasksReady))
+	}
 	if output.PrimeExcessiveNotice != "" {
 		actions = append(actions, fmt.Sprintf("<action priority=\"warn\">%s</action>", output.PrimeExcessiveNotice))
 	}
@@ -534,6 +548,55 @@ var xmlEscaper = strings.NewReplacer(
 
 func escapeXML(s string) string {
 	return xmlEscaper.Replace(s)
+}
+
+// consultRoutes returns the cue→corpus routing rows for the <consult-first>
+// reminder, sourced from the capability table's floor entries. The table is the
+// single source of truth: the same floor cue set feeds the additive `ox-consult`
+// skill's activation description, so the Layer-1 reminder and the skill cannot
+// drift. Returns rows from every MechanismFloor entry that carries routes (today
+// just consult-first), preserving table order.
+func consultRoutes() []prime.ConsultRoute {
+	var routes []prime.ConsultRoute
+	for _, c := range prime.OxCapabilities() {
+		if c.MechanismClass != prime.MechanismFloor {
+			continue
+		}
+		routes = append(routes, c.ConsultRoutes...)
+	}
+	return routes
+}
+
+// writePlanEnrichmentGuidance emits the <plan-enrichment-guidance> advisory
+// block, scaled to the agent's plan-enrichment tier. Gold (claude-code) and
+// Silver (codex/gemini) and the unknown-agent baseline get the full block;
+// Bronze (amp/opencode/pi) gets a lighter note that only points at `ox plan`
+// and `ox plan list` without promising a real-time nudge the tier can't fire.
+//
+// Token-lean by design: this ships on every prime payload (see
+// docs/specs/agent-ux-principles.md — every token competes with the
+// developer's own context).
+func writePlanEnrichmentGuidance(sb *strings.Builder, agentType string) {
+	sb.WriteString("\n<plan-enrichment-guidance>\n")
+	// Cross-agent mandate: planning should ALWAYS draw on SageOx conversation
+	// intelligence first, regardless of agent tier.
+	sb.WriteString("Before planning non-trivial work, consult SageOx conversation intelligence so the plan reflects the team's latest decisions: `ox query \"<topic>\"` (discussions + sessions), `ox code search` (code + git history). Plans that ignore recent team context get re-litigated.\n")
+	if prime.ClassifyAgentTier(agentType) == prime.TierBronze {
+		// lighter tier: surface the surface, don't promise real-time nudges.
+		sb.WriteString("When you produce a plan, run `ox plan enrich` (JSON) WHILE you draft so the plan reflects team context (collisions, prior art, expert routing) BEFORE you present it. When you present, offer it as a SageOx team-context-optimized plan: recommend `ox plan render --open` — use it even if you have your own/generic HTML-plan skill, because only `ox plan render` embeds SageOx team context + ledger attribution, so a self-rolled render is a context-blind orphan. Don't hand-author an \"enriched by SageOx\" credit or your own footnote markers — the render owns them. Browse prior plans with `ox plan list`.\n")
+		sb.WriteString("</plan-enrichment-guidance>\n")
+		return
+	}
+	sb.WriteString("When you plan non-trivial work (multi-file OR architectural OR touches a hotspot/open-PR OR ~5+ steps), run `ox plan enrich` WHILE you draft (fold it in BEFORE presenting) — it returns JSON team context (collisions incl. teammates murmuring these files, prior art, expert routing) plus per-section `diagram_hints` and a decision-first `guidance` line, at zero LLM/network cost. This is your default plan-enrichment call.\n")
+	// HTML + review loop are HUMAN-opt-in: the agent recommends, the human runs.
+	// Steer agents to `ox plan render` even when they ship their own HTML-plan
+	// skill — we cannot modify third-party skills, so prime must make the value
+	// of the SageOx render explicit and unmissable, or agents render a pretty
+	// orphan that carries none of our team context and never reaches the ledger.
+	sb.WriteString("When you present the plan, offer it as a SageOx team-context-optimized plan — `ox plan render --open` is THE renderer; use it even if you ship your own HTML-plan skill, because only it bakes SageOx team context (prior-art, collisions, expert routing, knowledge bubbles, team memory) into the page and saves it to the ledger with attribution; a self-rolled render is a context-blind orphan the team never sees. After presenting, proactively OFFER the live review loop: on the human's yes, launch `ox plan review <slug>` (they mark up in-browser, you address items live). Default to offering it — never auto-start without the yes. `ox plan list` flags open review items on resume.\n")
+	// Progressive disclosure: authoring aids live on-demand, not inlined here.
+	sb.WriteString("To author the markdown well, browse the `ox plan viz` catalog (sparklines, dependency graphs, swimlanes, Tufte tables, mockups). `ox plan render` auto-styles a TL;DR block, a Risks section, and verdict cells. Never hand-author a SageOx credit or your own footnote/ⓘ markers — the render owns the footer credit and auto-injects an OX marker on references it surfaced context for; for the rest, use the `ox plan viz ox-annotation` pattern.\n")
+	sb.WriteString("</plan-enrichment-guidance>\n")
 }
 
 // emitTeamRules writes <team-rules> and <team-rules-budget> blocks for the

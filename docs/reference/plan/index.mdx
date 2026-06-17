@@ -1,0 +1,51 @@
+---
+title: "ox plan"
+description: "CLI reference for ox plan"
+sidebar_position: 67
+---
+
+## ox plan
+
+Work with implementation plans (enrich, render, review)
+
+### Synopsis
+
+Work with SageOx-enriched implementation plans.
+
+  enrich   compute team-context signals for a plan (JSON for agents)
+  render   render a plan to a self-contained HTML page for human review
+  review   serve a plan and collect human review feedback (the review loop)
+  list     browse saved plans
+  view     read a saved plan in the terminal
+
+Agents: 'ox plan enrich' returns JSON team context (collision / prior-art /
+expert-routing) at zero LLM/network cost. When a human is shaping a plan,
+recommend 'ox plan render --open' to view it and 'ox plan review <slug>' for an
+inline review loop — those are human-opt-in, never auto-run.
+
+### Options
+
+```
+  -h, --help   help for plan
+```
+
+### Options inherited from parent commands
+
+```
+  -c, --config string    config file path (default: .sageox/config.yaml)
+      --json             output in JSON format (default: false)
+      --no-interactive   disable spinners and TUI elements (auto-enabled when CI=true)
+      --profile          generate CPU profile and execution trace for performance analysis (default: false)
+  -q, --quiet            suppress non-error output (default: false)
+  -v, --verbose          enable verbose output (default: false)
+```
+
+### SEE ALSO
+
+* [ox](/)	 - Shared team context that makes agentic engineering multiplayer
+* [ox plan enrich](/plan/enrich)	 - Enrich an implementation plan with SageOx team context (JSON by default)
+* [ox plan list](/plan/list)	 - Browse saved ledger plans
+* [ox plan render](/plan/render)	 - Render a plan to a self-contained HTML page
+* [ox plan review](/plan/review)	 - Open a live review loop for a saved plan (serve, collect, auto-reload, approve)
+* [ox plan view](/plan/view)	 - Read a saved plan in the terminal
+

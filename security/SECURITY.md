@@ -1,5 +1,3 @@
-<!-- doc-audience: ai -->
-
 # ox CLI — Threat Model
 
 > This file is the primary context for ox's `/security-review` pipeline. Every AI hunter and validator subagent loads it. OpenGrep rules and hunter prompts reference the `#hunter-*` anchors directly. Keep it terse, declarative, and current — if you change a security primitive in the code, update the matching section in the same PR.
@@ -283,6 +281,7 @@ flowchart LR
 - [`internal/daemon/ipc_peercred_linux.go`](../internal/daemon/ipc_peercred_linux.go) — peer-credential check
 - [`internal/daemon/ipc.go`](../internal/daemon/ipc.go) — size + connection caps, message dispatch
 - [`cmd/ox/adapter.go`](../cmd/ox/adapter.go) — adapter download + install
+- [`docs/adr/ADR-022-adapter-security-posture.md`](../docs/adr/ADR-022-adapter-security-posture.md) — adapter trust model: curated-path integrity (tag + sha256, verify-before-exec) vs frictionless arbitrary-repo install; what `verifyAdapterBinary` does and does not check
 - [`internal/gitserver/credentials.go`](../internal/gitserver/credentials.go) — keyring-backed git credentials
 - [`internal/auth/authfile.go`](../internal/auth/authfile.go) — OAuth token storage (file, NOT keyring — see open risk in [`#hunter-secrets-redaction`](#hunter-secrets-redaction))
 

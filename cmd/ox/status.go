@@ -12,6 +12,7 @@ import (
 	"time"
 
 	lipgloss "charm.land/lipgloss/v2"
+	"github.com/sageox/ox/internal/agenttask"
 	"github.com/sageox/ox/internal/api"
 	"github.com/sageox/ox/internal/auth"
 	"github.com/sageox/ox/internal/cli"
@@ -43,9 +44,11 @@ type statusTeamContextJSON = status.TeamContextJSON
 type statusDaemonJSON = status.DaemonJSON
 
 var statusJSONFlag bool
+var statusVerboseFlag bool
 
 func init() {
 	statusCmd.Flags().BoolVar(&statusJSONFlag, "json", false, "output in JSON format")
+	statusCmd.Flags().BoolVarP(&statusVerboseFlag, "verbose", "v", false, "show opaque IDs and full on-disk paths")
 }
 
 // status command styles - Tufte-inspired minimal design with brand colors
@@ -151,7 +154,7 @@ func renderTable(header string, rows [][]string) string {
 		value := row[1]
 
 		// determine semantic type (optional third element or auto-detect)
-		semantic := "default"
+		var semantic string
 		if len(row) > 2 {
 			semantic = row[2]
 		} else {
@@ -345,36 +348,6 @@ func getTeamContextRemoteURL(teamID, ep string) string {
 	return teamInfo.RepoURL
 }
 
-// fetchRemoteURLs fetches remote URLs from the cloud API for ledger and team contexts
-func fetchRemoteURLs(client *api.RepoClient, teamContexts []config.TeamContext) (ledgerURL string, teamURLs map[string]string) {
-	teamURLs = make(map[string]string)
-
-	// fetch repos for ledger URL
-	repos, err := client.GetRepos()
-	if err == nil && repos != nil {
-		for _, repo := range repos.Repos {
-			if repo.Type == "ledger" {
-				ledgerURL = repo.URL
-				break
-			}
-		}
-	}
-
-	// fetch team context URLs
-	for _, tc := range teamContexts {
-		if tc.TeamID == "" {
-			continue
-		}
-		teamInfo, err := client.GetTeamInfo(tc.TeamID)
-		if err == nil && teamInfo != nil && teamInfo.RepoURL != "" {
-			teamURLs[tc.TeamID] = teamInfo.RepoURL
-		}
-	}
-
-	return ledgerURL, teamURLs
-}
-
-// renderGitReposSection renders the git repositories status section
 // shortenPathViaSymlink returns a short relative path (e.g. ".sageox/ledger")
 // if a .sageox/ symlink in projectRoot resolves to fullPath.
 // Checks candidates in order and returns the first match, or fullPath unchanged.
@@ -400,7 +373,7 @@ func shortenPathViaSymlink(projectRoot, fullPath string, candidates ...string) s
 
 // Shows ledger and team contexts grouped by endpoint
 // Always renders both sections, showing "(none)" if not configured
-func renderGitReposSection(localCfg *config.LocalConfig, projectRoot string, daemonStatus *daemon.StatusData, bubblesSummary statusBubblesSummary) string {
+func renderGitReposSection(localCfg *config.LocalConfig, projectRoot string, daemonStatus *daemon.StatusData, bubblesSummary statusBubblesSummary, verbose bool) string {
 	var b strings.Builder
 
 	hasLedger := localCfg != nil && localCfg.Ledger != nil && localCfg.Ledger.Path != ""
@@ -889,28 +862,90 @@ func renderGitReposSection(localCfg *config.LocalConfig, projectRoot string, dae
 		b.WriteString("\n")
 	}
 
-	// Knowledge bubbles summary — rendered as the last line of the
-	// project-status block, immediately above "Other Team Contexts" so the
-	// kb noun is adjacent to the team contexts it (eventually) supersedes
-	// without dominating the project-state header.
-	b.WriteString(renderBubblesLine(bubblesSummary))
-
-	// Other team contexts
-	hasOtherTCs := len(otherCloudTCs) > 0 || len(otherDetailTCs) > 0
-	if hasOtherTCs {
-		b.WriteString("\n")
-		b.WriteString(statusHeaderStyle.Render("Other Team Contexts"))
-		b.WriteString("\n")
-		b.WriteString(statusMutedStyle.Render("───────────────────"))
-		b.WriteString("\n")
-
-		for _, entry := range otherCloudTCs {
-			hasAnyTeams = true
-			renderCloudTC(entry.info)
+	// Knowledge bubbles — dense, owner-grouped listing of the team contexts
+	// available beyond this repo. Replaces the old count-only line plus the
+	// "Other Team Contexts" section, which duplicated these teams and printed
+	// a full on-disk path per row. Each owner shows as @slug with a compact,
+	// color-coded status; the shared path prefix is printed once. This-repo's
+	// ledger and primary team stay in Project Status above.
+	buildOtherRow := func(name, slug, teamID, visibility, access string) otherTeamRow {
+		if slug == "" {
+			slug = api.DeriveSlug(name)
 		}
-		for _, entry := range otherDetailTCs {
-			hasAnyTeams = true
-			renderDetailTC(entry.info)
+		expectedPath := paths.TeamContextDir(teamID, projectEndpoint)
+		row := otherTeamRow{name: name, slug: slug, bubbleType: "team", visibility: visibility, access: access, path: expectedPath}
+		if _, err := os.Stat(filepath.Join(expectedPath, ".git")); err == nil {
+			row.cloned = true
+			var lastSync time.Time
+			hasSync := false
+			if ds, ok := daemonStatus.LastSyncForPath(expectedPath); ok {
+				lastSync, hasSync = ds, true
+			} else if localCfg != nil {
+				if tc := localCfg.GetTeamContext(teamID); tc != nil && tc.HasLastSync() {
+					lastSync, hasSync = tc.LastSync, true
+				}
+			}
+			row.st = getGitRepoStatus(expectedPath, lastSync, hasSync)
+		}
+		row.attention = !row.cloned || row.st.Error != "" || row.st.UncommittedCount > 0 || row.st.IsWedged()
+		return row
+	}
+
+	var otherRows []otherTeamRow
+	seenBubblePath := make(map[string]bool)
+	for _, entry := range otherCloudTCs {
+		visibility, access := "private", "member"
+		if d, ok := teamDetail[entry.info.StableID()]; ok {
+			if d.Visibility != "" {
+				visibility = d.Visibility
+			}
+			if d.AccessLevel != "" {
+				access = d.AccessLevel
+			}
+		}
+		row := buildOtherRow(entry.info.Name, entry.info.Slug, entry.info.StableID(), visibility, access)
+		if seenBubblePath[row.path] {
+			continue
+		}
+		seenBubblePath[row.path] = true
+		otherRows = append(otherRows, row)
+	}
+	for _, entry := range otherDetailTCs {
+		visibility := entry.info.Visibility
+		if visibility == "" {
+			visibility = "private"
+		}
+		row := buildOtherRow(entry.info.Name, entry.info.Slug, entry.info.StableID(), visibility, entry.info.AccessLevel)
+		if seenBubblePath[row.path] {
+			continue
+		}
+		seenBubblePath[row.path] = true
+		otherRows = append(otherRows, row)
+	}
+
+	sortOtherBubbleRows(otherRows)
+
+	if len(otherRows) > 0 {
+		hasAnyTeams = true
+	}
+
+	if bubblesSummary.Total > 0 || len(otherRows) > 0 {
+		b.WriteString("\n")
+		b.WriteString(statusHeaderStyle.Render("Knowledge Bubbles"))
+		b.WriteString("  ")
+		b.WriteString(statusMutedStyle.Render(bubblesCountSummary(bubblesSummary, len(otherRows))))
+		b.WriteString("\n")
+		b.WriteString(statusMutedStyle.Render("─────────────────"))
+		b.WriteString("\n")
+		if len(otherRows) > 0 {
+			b.WriteString(renderOtherBubbleRows(otherRows, daemonStatus.IsBootstrapping(), verbose))
+		} else {
+			// bubbles exist (e.g. personal/profile) but none are team contexts
+			// cloned locally — point at the full list rather than leave an
+			// empty block under the header.
+			b.WriteString(statusLabelStyle.Render(""))
+			b.WriteString(statusMutedStyle.Render("no team contexts cloned locally — run 'ox kb list' to see all bubbles"))
+			b.WriteString("\n")
 		}
 	}
 
@@ -1310,6 +1345,84 @@ func renderAICoworkersSection(client *daemon.Client) string {
 	return b.String()
 }
 
+// renderAgentTasksSection renders a one-line summary of scheduled agent tasks.
+// Emits nothing when the queue is empty so it never clutters a clean status.
+// Detail belongs in `ox agent <id> tasks list`.
+func renderAgentTasksSection(gitRoot string) string {
+	ready, inProgress := countAgentTasks(gitRoot)
+	if ready == 0 && inProgress == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("\n")
+	b.WriteString(statusLabelStyle.Render("Agent Tasks"))
+	// pending work is informational, not a "success" state — use a neutral
+	// highlight (no ✓ glyph) so "N ready" doesn't read as "N completed".
+	switch {
+	case ready > 0 && inProgress > 0:
+		b.WriteString(formatValue(fmt.Sprintf("%d ready, %d in progress", ready, inProgress), "highlight"))
+	case ready > 0:
+		b.WriteString(formatValue(fmt.Sprintf("%d ready", ready), "highlight"))
+	default:
+		b.WriteString(formatValue(fmt.Sprintf("%d in progress", inProgress), "muted"))
+	}
+	b.WriteString(statusMutedStyle.Render("  (ox agent <id> tasks list)"))
+	b.WriteString("\n")
+	return b.String()
+}
+
+// countAgentTasks returns the ready and in-progress task counts for the repo,
+// reconciling stale leases as a side effect of the read. Returns (0, 0) when
+// there is no queue or it cannot be read.
+func countAgentTasks(gitRoot string) (ready, inProgress int) {
+	if gitRoot == "" {
+		return 0, 0
+	}
+	// avoid creating the queue dir as a side effect of a status read
+	if !agenttask.QueueExists(gitRoot) {
+		return 0, 0
+	}
+	store, err := agenttask.NewStore(gitRoot)
+	if err != nil {
+		return 0, 0
+	}
+	defer store.Close()
+	tasks, err := store.ListView(false)
+	if err != nil {
+		return 0, 0
+	}
+	for _, t := range tasks {
+		switch t.Status {
+		case agenttask.StatusReady:
+			ready++
+		case agenttask.StatusInProgress:
+			inProgress++
+		}
+	}
+	return ready, inProgress
+}
+
+// countReadyAgentTasks returns the number of ready tasks the given agent type
+// may claim. Used by prime to surface scheduled work at session start — the
+// universal delivery channel (every adapter runs prime). Best-effort and gated
+// on the queue existing so the read never materializes the directory.
+func countReadyAgentTasks(gitRoot, agentType string) int {
+	if gitRoot == "" || !agenttask.QueueExists(gitRoot) {
+		return 0
+	}
+	store, err := agenttask.NewStore(gitRoot)
+	if err != nil {
+		return 0
+	}
+	defer store.Close()
+	ready, err := store.ReadyView(agentType)
+	if err != nil {
+		return 0
+	}
+	return len(ready)
+}
+
 var statusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Display SageOx status and directory locations",
@@ -1499,13 +1612,16 @@ daemon health, and a tree view of all SageOx directory locations.`,
 			// Knowledge-bubbles summary is rendered inside renderGitReposSection
 			// (just above "Other Team Contexts") so the kb line is the
 			// last line of the project-state block, not sandwiched mid-header.
-			fmt.Print(renderGitReposSection(localCfg, gitRoot, daemonStatus, bubblesSummary))
+			fmt.Print(renderGitReposSection(localCfg, gitRoot, daemonStatus, bubblesSummary, statusVerboseFlag))
 
 			// show daemon sync section
 			fmt.Print(renderDaemonSyncSection(daemonStatus, syncHistory, localCfg, false, projectInitialized))
 
 			// show active AI coworkers with context stats
 			fmt.Print(renderAICoworkersSection(client))
+
+			// show pending scheduled agent tasks, if any
+			fmt.Print(renderAgentTasksSection(gitRoot))
 		}
 
 		// show version update notice if available
@@ -1546,6 +1662,12 @@ func buildStatusJSON(authenticated bool, authErr error, token *auth.StoredToken,
 	// bubbles section — additive; team_contexts/ledger mirrors below
 	// stay populated for one release per the kb plan.
 	output.Bubbles = buildBubblesJSON(bubblesSummary)
+
+	// agent-task queue summary — mirror the human one-liner; omit when empty so
+	// JSON consumers see the same "silent when empty" behavior.
+	if ready, inProgress := countAgentTasks(gitRoot); ready > 0 || inProgress > 0 {
+		output.AgentTasks = &status.AgentTasksJSON{Ready: ready, InProgress: inProgress}
+	}
 
 	// auth section
 	output.Auth = &statusAuthJSON{

@@ -7,7 +7,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/sageox/ox/internal/daemon"
+	"github.com/sageox/ox/internal/cli"
 	"github.com/sageox/ox/internal/session"
 	"github.com/sageox/ox/internal/session/adapters"
 	"github.com/sageox/ox/internal/version"
@@ -154,56 +154,6 @@ func checkRecordingAdapters(projectRoot string) []checkResult {
 	return results
 }
 
-// checkAdapterProcessHealth queries the daemon's adapter supervisor status
-// and reports any adapters in crashed or degraded state. Returns nil if the
-// daemon is not running or has no adapter status.
-func checkAdapterProcessHealth(status *daemon.StatusData, verbose bool) []checkResult {
-	if status == nil || len(status.Adapters) == 0 {
-		return nil
-	}
-
-	var results []checkResult
-
-	for adapterType, as := range status.Adapters {
-		switch as.State {
-		case "degraded":
-			detail := fmt.Sprintf("respawn_count=%d, adapter has been disabled after repeated crashes", as.RespawnCount)
-			if verbose && len(as.StderrTail) > 0 {
-				detail += "\nstderr:\n  " + strings.Join(as.StderrTail, "\n  ")
-			}
-			results = append(results, WarningCheck(
-				adapterType+" adapter process",
-				"adapter degraded: max respawns exceeded",
-				detail,
-			).WithFixInfo(adapterType+":process-degraded", FixLevelCheckOnly))
-
-		case "crashed":
-			detail := fmt.Sprintf("respawn_count=%d, adapter process crashed and is awaiting respawn", as.RespawnCount)
-			if verbose && len(as.StderrTail) > 0 {
-				detail += "\nstderr:\n  " + strings.Join(as.StderrTail, "\n  ")
-			}
-			results = append(results, WarningCheck(
-				adapterType+" adapter process",
-				"adapter crashed",
-				detail,
-			).WithFixInfo(adapterType+":process-crashed", FixLevelCheckOnly))
-
-		case "running":
-			if as.RespawnCount > 0 {
-				// running but has respawned -- surface as info for awareness
-				results = append(results, InfoCheck(
-					adapterType+" adapter process",
-					fmt.Sprintf("running (respawned %d time(s))", as.RespawnCount),
-					fmt.Sprintf("pid=%d, sessions=%d", as.PID, len(as.Sessions)),
-				))
-			}
-			// healthy running adapters with no respawns are not reported to reduce noise
-		}
-	}
-
-	return results
-}
-
 // adapterIssueSlug returns the namespaced slug for an adapter issue.
 func adapterIssueSlug(adapterName, issueSlug string) string {
 	return adapterName + ":" + issueSlug
@@ -277,6 +227,33 @@ var adapterFixArgvAllowlist = map[string]bool{
 	"ox":  true,
 }
 
+// gitScopeEscalationFlags are argv tokens that escalate a fix beyond the current
+// repo into machine-wide / persistent state. `git config --global|--system|
+// --worktree` and git's inline `-c` are the persistence vectors; the same flags
+// are treated as escalating for `ox` argv too (ADR-022 §8).
+var gitScopeEscalationFlags = map[string]bool{
+	"--global":   true,
+	"--system":   true,
+	"--worktree": true,
+	"-c":         true,
+}
+
+// argvHasScopeEscalation reports whether any argument (after argv[0]) is a
+// scope-escalating flag, including the `--global=...` joined form.
+func argvHasScopeEscalation(argv []string) bool {
+	for _, a := range argv[1:] {
+		if gitScopeEscalationFlags[a] {
+			return true
+		}
+		for flag := range gitScopeEscalationFlags {
+			if strings.HasPrefix(a, flag+"=") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // runAdapterFix executes a fix produced by an adapter.
 //
 // Hardening contract (ox-saoy):
@@ -303,6 +280,29 @@ func runAdapterFix(issue adapterprotocol.DiagnoseIssue, forceYes bool) error {
 			argv0, issue.Fix)
 	}
 
+	// A scope-escalating flag (e.g. `git config --global core.hooksPath=/tmp/evil`)
+	// grants machine-wide persistence — every future git command in every repo
+	// would run attacker code. FixSafe means "idempotent and non-destructive", NOT
+	// "run a persistence-granting command without showing the user". Per ADR-022 §8
+	// we surface the exact command and require explicit confirmation regardless of
+	// FixSafe/--yes, and refuse outright when we can't prompt. A key denylist
+	// (core.hooksPath, credential.helper, init.templateDir, …) is a losing game;
+	// gating on the scope flag is the durable control.
+	if argvHasScopeEscalation(issue.FixArgv) {
+		cli.PrintWarning(fmt.Sprintf("adapter-requested fix modifies global/system state:\n  %s",
+			strings.Join(issue.FixArgv, " ")))
+		if !cli.IsInteractive() {
+			return fmt.Errorf("auto-fix refused: %q modifies global/system state and cannot be confirmed non-interactively; apply manually: %s",
+				strings.Join(issue.FixArgv, " "), issue.Fix)
+		}
+		if !cli.ConfirmYesNo("Run this adapter-requested command?", false) {
+			return fmt.Errorf("auto-fix declined")
+		}
+	}
+
+	// Surface the exact command to the user (stdout, not only slog) so an
+	// adapter can never silently mutate state under `ox doctor --fix`.
+	fmt.Printf("  running: %s\n", strings.Join(issue.FixArgv, " "))
 	slog.Info("running adapter fix", "argv", issue.FixArgv)
 	cmd := exec.Command(issue.FixArgv[0], issue.FixArgv[1:]...)
 	output, err := cmd.CombinedOutput()

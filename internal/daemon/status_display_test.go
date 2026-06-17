@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -69,6 +70,73 @@ func TestFormatRelativeTime(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+// TestFormatDurationShort verifies the bare-magnitude formatter has NO "ago"
+// suffix. Failure prevented: reusing formatRelativeTime for countdowns produced
+// "gc in 6d ago" — a duration that reads like an elapsed timestamp.
+func TestFormatDurationShort(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		d    time.Duration
+		want string
+	}{
+		{"seconds", 5 * time.Second, "5s"},
+		{"minutes", 3 * time.Minute, "3m"},
+		{"hours", 2 * time.Hour, "2h"},
+		{"days", 6*24*time.Hour + 23*time.Hour, "6d"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, formatDurationShort(tt.d))
+		})
+	}
+}
+
+// TestFormatGCStatus verifies the GC suffix reads correctly across states.
+// Failure prevented: "gc in 6d ago" (countdown with a stray "ago") and the
+// verbose double-"ago" "(last 1h ago ago)".
+func TestFormatGCStatus(t *testing.T) {
+	t.Parallel()
+
+	t.Run("never run shows gc due", func(t *testing.T) {
+		t.Parallel()
+		ws := WorkspaceSyncStatus{GCIntervalDays: 7} // LastGCTime zero
+		assert.Equal(t, "· gc due", strings.TrimSpace(stripANSI(formatGCStatus(ws, false))))
+	})
+
+	t.Run("recent gc shows countdown without ago", func(t *testing.T) {
+		t.Parallel()
+		ws := WorkspaceSyncStatus{
+			GCIntervalDays: 7,
+			LastGCTime:     time.Now().Add(-1 * time.Hour),
+		}
+		got := strings.TrimSpace(stripANSI(formatGCStatus(ws, false)))
+		assert.Equal(t, "· gc in 6d", got)
+		assert.NotContains(t, got, "ago")
+	})
+
+	t.Run("verbose appends single ago for elapsed", func(t *testing.T) {
+		t.Parallel()
+		ws := WorkspaceSyncStatus{
+			GCIntervalDays: 7,
+			LastGCTime:     time.Now().Add(-1 * time.Hour),
+		}
+		got := strings.TrimSpace(stripANSI(formatGCStatus(ws, true)))
+		assert.Equal(t, "· gc in 6d (last 1h ago)", got)
+		assert.NotContains(t, got, "ago ago")
+	})
+
+	t.Run("overdue shows gc due", func(t *testing.T) {
+		t.Parallel()
+		ws := WorkspaceSyncStatus{
+			GCIntervalDays: 7,
+			LastGCTime:     time.Now().Add(-8 * 24 * time.Hour),
+		}
+		assert.Equal(t, "· gc due", strings.TrimSpace(stripANSI(formatGCStatus(ws, false))))
+	})
 }
 
 func TestShortenPath_StatusDisplay(t *testing.T) {

@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-06-15
+
+### Added
+
+- **ox installs its skills and commands into Codex and Droid, not just Claude Code** — capability injection now follows an explicit two-layer model with a cross-agent conformance test, so the portable "floor" (prime, consult-first recall, plan enrichment, session review, cart lifecycle) reaches every supported agent, and the per-agent ergonomic surfaces can no longer silently drift or orphan.
+- **`ox import --kb <slug>` brings media and video-URL import to Knowledge Bubbles** — import now reaches bubbles at parity with team contexts (mutually exclusive with `--team`), streaming large media files through a presigned upload so they never load fully into memory.
+- **`ox code prs` ranks indexed pull requests for triage** — a new deterministic view (no LLM, no live API) that surfaces the most-stalled open PRs first, each row carrying age, idle-days, comment/reviewer/discussant counts, and labels (`--sort age|activity`, `--state`). Backed by ADR-019 phase-1 resolved `symbol_edges`, which also make `ox code calls` / `calledby` more accurate.
+- **Knowledge Bubbles now appear in `ox daemon status`** — the daemon reports every bubble it has synced to disk (slug, type, freshness), plus a badge showing whether *this* daemon keeps them fresh or a sibling daemon does. Previously the daemon synced bubbles silently with no way to see what was happening.
+- **`ox doctor` gained knowledge-bubble repo health checks at parity with ledgers and team contexts** — detects bubbles the cloud lists but that were never cloned, bubbles wedged in a stuck merge/rebase (which silently block sync for every project), and bubbles whose sparse-checkout dropped `.sageox`. Repairs route through the daemon so they never collide with an in-flight sync.
+
+### Changed
+
+- **Knowledge Bubbles are now first-class in daemon status output** — the JSON `bubbles[]` array and a human-readable "Knowledge Bubbles" section make it clear which bubbles are local, fresh, and who is responsible for syncing them.
+- **Rendered plans own their SageOx brand surfaces** — `ox plan render` now emits the OX icon, a single subtle corner wordmark, and deterministic inline reference markers itself, so agents no longer hand-roll look-alike branding that drifts or duplicates. A marker means "SageOx has context on this," never a verdict — whether a plan aligns with or amends a decision stays the agent's call.
+
+### Fixed
+
+- **`ox daemon` no longer holds one open file descriptor per tracked file** — the recursive fsnotify/kqueue watcher opened a descriptor for every tracked file *and* directory, so FD usage scaled with repo size (≈11k on a large repo — enough that a few daemons together approached half the machine's FD table). It's replaced by lightweight `git status` polling that holds zero watch descriptors, honors `.gitignore` for free, and feeds the exact same downstream change pipeline. `ox doctor` also gained an absolute FD-pressure ceiling so a watcher-class regression trips regardless of the shell's raised limit.
+- **`ox daemon status` reports garbage-collection state correctly** — GC timestamps now persist to disk, so a daemon restart no longer reads every workspace as "gc due" and needlessly reclones it once per hour. The misleading "gc in 6d ago" / "(last 3d ago ago)" wording is fixed.
+
+## [0.10.0] - 2026-06-11
+
+### Added
+
+- **Cross-agent HTML plans with a human review loop** — `ox plan` renders a team-context-enriched plan as a self-contained HTML page for *any* coding agent, not just Claude Code, backed by a catalog of reusable visualizations (timelines, collision maps, sequence diagrams). A new review loop (`ox plan review`) serves the plan for inline human feedback, so a reviewer can shape the approach *before* any code is written — and the feedback is captured back to the ledger.
+- **Just-in-time `ox plan enrich` hint while drafting** — during plan mode (Claude Code), `ox` nudges the agent to fold deterministic team context (collisions, prior art, expert routing) into the plan *while it is being drafted*, so enrichment lands in the first draft a human sees rather than being bolted on after.
+
+### Changed
+
+- **Natively aligned Knowledge Bubbles in `ox status`** — the bubble listing now uses a label-column layout with owner and bubble names aligned in their own column, so the section reads as a clean table rather than ragged, variable-width rows.
+
+### Security
+
+- **Adapter integrity, a single redaction chokepoint, and environment + clone hardening (ADR-022)** — installed AI adapters are integrity-verified before use, every redaction path now funnels through one chokepoint that is far harder to bypass, and both environment-variable handling and team-context clones were hardened against credential leakage and untrusted-prompt injection.
+
+### Fixed
+
+- **`ox agent tasks` no longer panics when called with no subcommand** — invoking `tasks` bare previously sliced an empty argument list and crashed; it now guards the slice and prints usage.
+
+## [0.9.1] - 2026-06-08
+
+### Added
+
+- **`ox plan` — team-context-enriched implementation plans** — turns a plan an AI coworker drafts into one that knows where the team is going. `ox plan` annotates each part of a plan with deterministic, locally-computed signals (zero model tokens): **collisions** (a file you're about to touch is in a teammate's open PR — or one they murmured about minutes ago, before any commit exists), **prior art** (a teammate already planned or did this — surfaced from the ledger), and **expert routing** (who owns this area, with cited evidence, so you ask the right person). The plan-mode agent then authors the judgment calls — does this align with or conflict with a team decision — reasoning over a context bundle ox assembles. ox makes no model call itself; the inference cost lands in plan mode where you already expect it. Finalized plans are saved to the team ledger (`data/plans/`) as first-class, searchable artifacts, so today's plan becomes tomorrow's prior art. On Claude Code, a renderer skill turns the enriched plan into a beautiful self-contained HTML page for fast human review; other agents get the same enrichment via guidance and the `ox plan` CLI. Configure with `plan.save` and `plan.html` (`off`/`recommend`/`always`), or `SAGEOX_PLAN_HTML` per-run.
+
+### Changed
+
+- **`ox status` Knowledge Bubbles, denser and more useful** — the bubble section used to print a bare count (`9 (8 team, 1 repo)`) and then repeat every team again under "Other Team Contexts" with a full filesystem path on each row. It's now an owner-grouped listing that matches the rest of `ox status`: each owner is a row (`@slug` + display name, names aligned in a column) with its knowledge bubbles as indented sub-fields — the bubble type as the label, a compact color-coded freshness status as the value (`✓ 2h`, `⚠ 6 uncommitted`). Owners are separated by whitespace (cards that grow as owners gain more bubbles), the shared on-disk prefix is printed once, and slugs are never truncated. Since nearly every bubble is private, private is the silent default and only **PUBLIC** bubbles are flagged (bold, in the public accent color). Add `--verbose`/`-v` to reveal the opaque IDs and full paths.
+
 ## [0.9.0] - 2026-05-28
 
 ### Added
@@ -152,6 +201,7 @@ New tests pin the scope contract, the auto-redact happy path, the quarantine pat
 **Code search resilience**
 - `codedb` self-heals a corrupt bleve sub-index without forcing a full reindex. On large repos this drops recovery time from "several hours" to "2–5 minutes."
 
+[0.9.1]: https://github.com/sageox/ox/releases/tag/v0.9.1
 [0.9.0]: https://github.com/sageox/ox/releases/tag/v0.9.0
 [0.8.0]: https://github.com/sageox/ox/releases/tag/v0.8.0
 

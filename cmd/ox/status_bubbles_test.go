@@ -10,6 +10,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sageox/ox/internal/api"
 	"github.com/sageox/ox/internal/config"
@@ -396,4 +397,188 @@ func stripANSIBubbles(s string) string {
 		}
 		s = s[:i] + s[i+j+1:]
 	}
+}
+
+// --- Dense knowledge-bubble listing (owner-grouped @slug tree) ---
+
+// TestBubblesCountSummary verifies the section header reports the merger
+// total and the rendered count truthfully, without claiming a precise
+// in-repo split the two data sources can't guarantee.
+//
+// Failure prevented: a "N in this repo" claim drifts from reality because
+// the merger total counts kb-API/personal bubbles the team-context list omits.
+func TestBubblesCountSummary(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "13 bubbles · 7 owners",
+		bubblesCountSummary(statusBubblesSummary{Total: 13}, 7))
+
+	// merger total unavailable → fall back to the rendered count alone
+	assert.Equal(t, "7 owners listed",
+		bubblesCountSummary(statusBubblesSummary{Unavailable: true}, 7))
+	assert.Equal(t, "1 owner listed",
+		bubblesCountSummary(statusBubblesSummary{Total: 0}, 1))
+}
+
+// TestSortOtherBubbleRows_NeedsAttentionFirst verifies dirty/wedged/not-cloned
+// rows float to the top, then alphabetical by name.
+//
+// Failure prevented: a team with uncommitted work is buried mid-list where
+// the user scrolls past it.
+func TestSortOtherBubbleRows_NeedsAttentionFirst(t *testing.T) {
+	t.Parallel()
+
+	rows := []otherTeamRow{
+		{name: "Zulu", cloned: true},                      // clean
+		{name: "Alpha", cloned: true},                     // clean
+		{name: "Bravo", cloned: true, attention: true},    // dirty
+		{name: "Charlie", cloned: false, attention: true}, // not cloned
+	}
+	sortOtherBubbleRows(rows)
+
+	order := []string{rows[0].name, rows[1].name, rows[2].name, rows[3].name}
+	// attention rows first (Bravo, Charlie alphabetical), then clean (Alpha, Zulu)
+	assert.Equal(t, []string{"Bravo", "Charlie", "Alpha", "Zulu"}, order)
+}
+
+// TestRenderOtherBubbleRows verifies the owner-grouped listing matches the
+// native `ox status` label-column idiom: each owner is a label-row (@slug +
+// display name) with its bubble as an indented sub-field (type-as-label,
+// status-as-value), NO tree glyphs, a blank line between owners, slugs never
+// truncated, the on-disk prefix printed once, private silent / PUBLIC flagged,
+// and full paths only under verbose.
+//
+// Failure prevented: the section regresses to a cramped, glyph-heavy block that
+// clashes with the rest of status, truncates a slug, buries the bubble type, or
+// clutters every row with a redundant "private" marker.
+func TestRenderOtherBubbleRows(t *testing.T) {
+	t.Parallel()
+
+	base := "/home/u/.local/share/sageox/sageox.ai/teams"
+	longSlug := "dry-run-ice-cream-2026-05-01"
+	rows := []otherTeamRow{
+		{
+			name: "SageOx Internal", slug: "sageox-internal", bubbleType: "team", visibility: "private",
+			path: base + "/team_aaa", cloned: true, attention: true,
+			st: gitRepoStatus{Exists: true, UncommittedCount: 6},
+		},
+		{
+			name: "Dry Run - Ice Cream 2026-05-01", slug: longSlug, bubbleType: "team", visibility: "private",
+			path: base + "/team_bbb", cloned: true,
+			st: gitRepoStatus{Exists: true, HasLastSync: true, LastSync: time.Now().Add(-2 * time.Hour)},
+		},
+		{
+			name: "Open Docs", slug: "open-docs", bubbleType: "team", visibility: "public",
+			path: base + "/team_ccc", cloned: true,
+			st: gitRepoStatus{Exists: true, HasLastSync: true, LastSync: time.Now().Add(-5 * time.Minute)},
+		},
+	}
+
+	out := stripANSIBubbles(renderOtherBubbleRows(rows, false, false))
+
+	// owner label-row: full @slug (never truncated) + display name
+	assert.Contains(t, out, "@sageox-internal")
+	assert.Contains(t, out, "@"+longSlug, "slug must render in full — no ellipsis")
+	assert.NotContains(t, out, "…", "slugs are never shortened with an ellipsis")
+	assert.NotContains(t, out, "team_aaa", "opaque ids hidden unless --verbose")
+
+	// bubble is an indented type sub-label — NO tree glyphs (foreign to the idiom)
+	assert.NotContains(t, out, "└─", "no tree glyphs — matches the label-column idiom")
+	assert.NotContains(t, out, "├─")
+	assert.Regexp(t, `(?m)^  team `, out, "bubble renders as an indented 'team' sub-field")
+
+	// display names align vertically at the shared value column
+	for _, r := range rows {
+		line := ownerLineFor(out, "@"+r.slug)
+		require.NotEmpty(t, line, "owner line present for @%s", r.slug)
+		runes := []rune(line)
+		require.GreaterOrEqual(t, len(runes), bubbleValueCol)
+		assert.Equal(t, r.name, strings.TrimRight(string(runes[bubbleValueCol:]), " "),
+			"display name for @%s must start at the shared value column", r.slug)
+	}
+
+	// shared prefix printed once as a header, never per row
+	assert.Equal(t, 1, strings.Count(out, "on disk"))
+
+	// per-bubble status: crisp age for clean, count for dirty
+	assert.Contains(t, out, "✓ 5m", "clean repo shows freshness age, not the word synced")
+	assert.Contains(t, out, "⚠ 6 uncommitted")
+
+	// visibility: private is silent, only PUBLIC is flagged
+	assert.NotContains(t, out, "private", "private is the silent default — no marker")
+	assert.Contains(t, out, "PUBLIC", "public bubbles are flagged")
+
+	// owners separated by a blank line (cards)
+	assert.Contains(t, out, "\n\n@", "a blank line precedes each owner card")
+
+	// verbose reveals the full on-disk path
+	verbose := stripANSIBubbles(renderOtherBubbleRows(rows, false, true))
+	assert.Contains(t, verbose, base+"/team_aaa")
+}
+
+// ownerLineFor returns the (ANSI-stripped) line beginning with the given owner
+// slug prefix, or "" if not found.
+func ownerLineFor(out, prefix string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return line
+		}
+	}
+	return ""
+}
+
+// TestRenderBubbleStatus covers each status cell variant and that the freshness
+// age (not the word "synced") is the clean-repo signal.
+func TestRenderBubbleStatus(t *testing.T) {
+	t.Parallel()
+
+	clean := stripANSIBubbles(renderBubbleStatus(
+		gitRepoStatus{Exists: true, HasLastSync: true, LastSync: time.Now().Add(-3 * 24 * time.Hour)}, true, false))
+	assert.Equal(t, "✓ 3d", clean)
+
+	dirty := stripANSIBubbles(renderBubbleStatus(gitRepoStatus{Exists: true, UncommittedCount: 18}, true, false))
+	assert.Equal(t, "⚠ 18 uncommitted", dirty)
+
+	wedged := stripANSIBubbles(renderBubbleStatus(gitRepoStatus{Exists: true, RebaseInProgress: true}, true, false))
+	assert.Equal(t, "⚠ rebase wedged", wedged)
+
+	// the other IsWedged() branch: diverged (both ahead and behind)
+	diverged := stripANSIBubbles(renderBubbleStatus(gitRepoStatus{Exists: true, AheadCount: 2, BehindCount: 1}, true, false))
+	assert.Equal(t, "⚠ diverged", diverged)
+
+	notCloned := stripANSIBubbles(renderBubbleStatus(gitRepoStatus{}, false, false))
+	assert.Equal(t, "⚠ not cloned", notCloned)
+}
+
+// TestRenderSlugRef verifies the sigil and slug are rendered as distinct
+// segments so the muted sigil + bright slug styling can apply per the design.
+func TestRenderSlugRef(t *testing.T) {
+	t.Parallel()
+
+	out := stripANSIBubbles(renderSlugRef("@", "sageox"))
+	assert.Equal(t, "@sageox", out)
+	out = stripANSIBubbles(renderSlugRef("#", "marketing"))
+	assert.Equal(t, "#marketing", out)
+}
+
+// TestCommonBubbleBase verifies the "on disk" prefix is the directory shared by
+// ALL rows, so it stays accurate if bubbles ever live under different parents
+// (e.g. teams/ and kb/) — not just the first attention-sorted row's parent.
+func TestCommonBubbleBase(t *testing.T) {
+	t.Parallel()
+
+	d := "/home/u/.local/share/sageox/sageox.ai"
+	// all under teams/ → that shared parent
+	same := []otherTeamRow{
+		{path: d + "/teams/team_a"},
+		{path: d + "/teams/team_b"},
+	}
+	assert.Equal(t, d+"/teams", commonBubbleBase(same))
+
+	// mixed teams/ and kb/ → the endpoint dir they share, not teams/
+	mixed := []otherTeamRow{
+		{path: d + "/teams/team_a"},
+		{path: d + "/kb/kb_x"},
+	}
+	assert.Equal(t, d, commonBubbleBase(mixed))
 }

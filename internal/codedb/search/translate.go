@@ -487,6 +487,14 @@ func translateComment(query *ParsedQuery) (*TranslatedQuery, error) {
 }
 
 func translateCallers(query *ParsedQuery) (*TranslatedQuery, error) {
+	// ADR-019 phase 1 read path: when the caller asked for a confidence
+	// threshold, route to the resolved symbol_edges path. Without it we keep
+	// the historical symbol_refs name-match (preserves behavior on codedbs
+	// without any edges yet).
+	if query.Filters.Confidence != "" {
+		return translateCallersEdges(query)
+	}
+
 	f := query.Filters
 	p := newParamCollector(f.Case)
 
@@ -571,6 +579,12 @@ LIMIT %d`, targetParam, depthParam, revSQL, limit)
 }
 
 func translateCallees(query *ParsedQuery) (*TranslatedQuery, error) {
+	// ADR-019 phase 1 read path: confidence: filter routes to the resolved
+	// symbol_edges variant. See translateCallers for the same dispatch.
+	if query.Filters.Confidence != "" {
+		return translateCalleesEdges(query)
+	}
+
 	f := query.Filters
 	p := newParamCollector(f.Case)
 

@@ -8,10 +8,11 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 )
 
-// GeminiRunner implements Runner using `gemini -p`.
+// GeminiRunner implements Runner using `gemini` with the prompt delivered via stdin.
 // It spawns Gemini CLI in non-interactive (headless) mode.
 // GeminiRunner is safe for concurrent use — each Run() call is independent.
 type GeminiRunner struct {
@@ -57,9 +58,13 @@ func (r *GeminiRunner) Run(ctx context.Context, req RunRequest) (*RunResult, err
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	args := []string{"-p", req.Prompt}
-
-	cmd := exec.CommandContext(ctx, r.binaryPath, args...)
+	// Gemini runs non-interactively (headless) when its stdin is not a TTY and
+	// reads the prompt from stdin. The prompt is fed via stdin rather than the
+	// `-p` argv value so the (potentially sensitive) session transcript does not
+	// appear in ps / /proc/<pid>/cmdline / sysctl kern.procargs2 (security
+	// finding #10).
+	cmd := exec.CommandContext(ctx, r.binaryPath)
+	cmd.Stdin = strings.NewReader(req.Prompt)
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
 	}

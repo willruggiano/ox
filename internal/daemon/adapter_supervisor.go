@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sageox/ox/internal/envutil"
 	"github.com/sageox/ox/pkg/adapterprotocol"
 	"github.com/sageox/ox/pkg/ndjson"
 )
@@ -71,7 +72,6 @@ type AdapterProcess struct {
 	respawnCount int
 	lastActivity time.Time
 	crashed      bool
-	degraded     bool // set when max respawns exceeded
 
 	// stderr ring buffer for debugging
 	stderrRing *stderrRingBuffer
@@ -496,9 +496,17 @@ func (s *AdapterSupervisor) spawnAdapterLocked(adapterType string) (*AdapterProc
 	}
 
 	cmd := exec.Command(binaryPath, "--serve")
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("OX_PROTOCOL_VERSION=%d", adapterprotocol.ProtocolVersion),
-	)
+	// A serve-mode adapter is a long-lived THIRD-PARTY binary; the full daemon
+	// environment (SAGEOX_TOKEN, GITHUB_TOKEN, AWS_*, …) crossing into it is a
+	// real trust-boundary leak (ADR-022 §6). Sanitize to the default allowlist.
+	// TODO(ox-gkqu): pass the adapter's declared info.RequiredEnv here instead of
+	// nil so adapters can receive their own non-secret config. The supervisor
+	// currently only knows adapterType + capabilities at spawn time, not the
+	// adapter's RequiredEnv (which lives in the ADR-010 InfoResponse and is not
+	// plumbed through findBinary). Wiring that through is follow-up work.
+	// SanitizedEnv already injects the compiled OX_PROTOCOL_VERSION as the sole,
+	// authoritative copy (it drops any inherited value), so no manual append.
+	cmd.Env = envutil.SanitizedEnv(os.Environ(), nil)
 
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {

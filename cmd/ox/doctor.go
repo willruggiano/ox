@@ -547,7 +547,6 @@ type doctorProgress struct {
 	verbose     bool
 	lastStart   time.Time
 	lastName    string
-	lineCount   int
 
 	ctx         context.Context
 	currentSpan trace.Span
@@ -689,6 +688,12 @@ func runDoctorChecks(parent context.Context, opts doctorOptions) []checkCategory
 	integrationChecks := []checkResult{
 		checkAgentFileExists(),
 		checkAgentsIntegrationWithFix(os.Stdout, opts.shouldFix(CheckSlugClaudeCodeHooks)),
+		checkInstructionFileMarkers(),
+	}
+	// detect adapter rules drift across all rules-installing adapters (claude, droid);
+	// runs unconditionally and is skipped gracefully when no rules adapter is present
+	if rulesCheck := checkAdapterRules(opts.shouldFix(CheckSlugAdapterRules)); !rulesCheck.skipped {
+		integrationChecks = append(integrationChecks, rulesCheck)
 	}
 	if detectClaudeCode() {
 		integrationChecks = append(integrationChecks, checkClaudeCodeHooks(opts.shouldFix(CheckSlugClaudeCodeHooks)))
@@ -719,6 +724,8 @@ func runDoctorChecks(parent context.Context, opts doctorOptions) []checkCategory
 		}
 		// verify ox-* slash commands are installed in .claude/commands/
 		integrationChecks = append(integrationChecks, checkClaudeCommands(opts.shouldFix(CheckSlugClaudeCommands)))
+		// detect installed skills drift in .claude/skills/ox-* (claude-only surface)
+		integrationChecks = append(integrationChecks, checkClaudeSkills(opts.shouldFix(CheckSlugClaudeSkills)))
 	}
 	if detectOpenCode() {
 		integrationChecks = append(integrationChecks, checkOpenCodeHooks(opts.shouldFix(CheckSlugOpenCodeHooks)))
@@ -906,6 +913,8 @@ func runDoctorChecks(parent context.Context, opts doctorOptions) []checkCategory
 	agentEnvChecks = append(agentEnvChecks, checkInstanceStale(opts.shouldFix(CheckSlugInstanceStale)))
 	// add daemon agent instance stale check (queries daemon for stale heartbeats)
 	agentEnvChecks = append(agentEnvChecks, checkDaemonInstanceStale(opts.shouldFix(CheckSlugDaemonInstanceStale)))
+	// add agent task queue check (reclaims stale leases, surfaces poison tasks)
+	agentEnvChecks = append(agentEnvChecks, checkAgentTasksStuck(opts.shouldFix(CheckSlugAgentTasksStuck)))
 	categories = append(categories, checkCategory{
 		name:   "Agent Environment",
 		checks: agentEnvChecks,
@@ -937,7 +946,7 @@ func runDoctorChecks(parent context.Context, opts doctorOptions) []checkCategory
 	// intact (see TestDoctorSuppression_DaemonNotRunning) while still
 	// making the predicate visible. Ephemeral mode is the most common
 	// explanation for an absent daemon, but it deserves its own grouping.
-	// See docs/ai/adr/adr-ephemeral-mode.md.
+	// See docs/adr/adr-ephemeral-mode.md.
 	progress.show("Ephemeral Mode")
 	categories = append(categories, checkCategory{
 		name:   "Ephemeral Mode",
@@ -1391,51 +1400,6 @@ func renderFixLevelBadge(level FixLevel) string {
 // renderAgentRequiredBadge returns a styled badge for agent-required checks
 func renderAgentRequiredBadge() string {
 	return ui.WarnStyle.Render("[agent]")
-}
-
-// renderFixableSlugs displays available fix slugs grouped by fix level
-func renderFixableSlugs(cmd *cobra.Command, slugs []fixSlugInfo) {
-	if len(slugs) == 0 {
-		return
-	}
-
-	// group by fix level
-	autoFixes := []string{}
-	suggestedFixes := []string{}
-	confirmFixes := []string{}
-
-	for _, s := range slugs {
-		switch s.fixLevel {
-		case FixLevelAuto:
-			autoFixes = append(autoFixes, s.slug)
-		case FixLevelSuggested:
-			suggestedFixes = append(suggestedFixes, s.slug)
-		case FixLevelConfirm:
-			confirmFixes = append(confirmFixes, s.slug)
-		}
-	}
-
-	fmt.Fprintln(cmd.OutOrStdout())
-	fmt.Fprintln(cmd.OutOrStdout(), ui.MutedStyle.Render("Available fixes:"))
-
-	if len(autoFixes) > 0 {
-		sort.Strings(autoFixes)
-		fmt.Fprintf(cmd.OutOrStdout(), "  %s %s\n",
-			renderFixLevelBadge(FixLevelAuto),
-			ui.MutedStyle.Render(strings.Join(autoFixes, ", ")))
-	}
-	if len(suggestedFixes) > 0 {
-		sort.Strings(suggestedFixes)
-		fmt.Fprintf(cmd.OutOrStdout(), "  %s %s\n",
-			renderFixLevelBadge(FixLevelSuggested),
-			ui.MutedStyle.Render(strings.Join(suggestedFixes, ", ")))
-	}
-	if len(confirmFixes) > 0 {
-		sort.Strings(confirmFixes)
-		fmt.Fprintf(cmd.OutOrStdout(), "  %s %s\n",
-			renderFixLevelBadge(FixLevelConfirm),
-			ui.MutedStyle.Render(strings.Join(confirmFixes, ", ")))
-	}
 }
 
 // displayPrioritySummary shows issues grouped by priority (default view)

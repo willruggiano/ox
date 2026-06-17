@@ -9,6 +9,7 @@ import (
 	"github.com/sageox/agentx"
 	"github.com/sageox/agentx/rules"
 	_ "github.com/sageox/agentx/setup"
+	"github.com/sageox/ox/internal/adapterstamp"
 	"github.com/sageox/ox/pkg/adapterprotocol"
 )
 
@@ -29,6 +30,16 @@ func handleInstallRules(p adapterprotocol.RulesParams) (*adapterprotocol.Install
 	}
 
 	ruleFiles := oxRuleFiles(p.Version)
+
+	// agentx's Install (via ShouldWriteRule) only compares the STAMP hash to the
+	// expected content hash. A hand-edited body leaves the stamp intact, so the
+	// stamp still matches and Install skips the rewrite — meaning `ox doctor
+	// --fix` would not actually restore a tampered body. Remove any of our
+	// stamped files whose on-disk body no longer matches their own stamp so the
+	// Install below rewrites them fresh. See adapterstamp.AppendFrontmatterStale
+	// for the same frontmatter-aware staleness reasoning.
+	adapterstamp.RemoveTamperedRules(rulesDir, ruleFiles)
+
 	written, err := rm.Install(context.Background(), p.RepoRoot, ruleFiles, true)
 	if err != nil {
 		return nil, err
@@ -49,11 +60,22 @@ func handleCheckRules(p adapterprotocol.RulesParams) (*adapterprotocol.CheckRule
 		return nil, err
 	}
 
+	// agentx v0.1.10's IsRuleStale (via ExtractCommandHash) only inspects the
+	// first line. Every rule we install carries YAML frontmatter (Description
+	// is set), so buildContent prepends `---\n...\n---` BEFORE the stamp and the
+	// stamp never lands on line 1 — staleness is structurally invisible and a
+	// hand-edited body is reported fresh forever. Recompute staleness here by
+	// scanning all lines for the stamp, mirroring the LooksStamped workaround
+	// already used for uninstall. Drop this block when agentx fixes the
+	// first-line limitation upstream.
+	rulesDir := rm.RulesDir(p.RepoRoot)
+	stale = adapterstamp.AppendFrontmatterStale(rulesDir, ruleFiles, missing, stale)
+
 	return &adapterprotocol.CheckRulesResponse{
 		Installed: len(missing) == 0 && len(stale) == 0,
 		Missing:   missing,
 		Stale:     stale,
-		RulesDir:  rm.RulesDir(p.RepoRoot),
+		RulesDir:  rulesDir,
 	}, nil
 }
 
@@ -107,7 +129,7 @@ func uninstallNamespaceFiles(rulesDir string) ([]string, error) {
 		if err != nil {
 			continue
 		}
-		if !looksStamped(data) {
+		if !adapterstamp.LooksStamped(data) {
 			continue
 		}
 		if err := os.Remove(path); err == nil {
@@ -120,15 +142,6 @@ func uninstallNamespaceFiles(rulesDir string) ([]string, error) {
 	}
 
 	return removed, nil
-}
-
-// looksStamped: workaround for agentx ExtractCommandHash only inspecting
-// the first line — fails on files with frontmatter.
-func looksStamped(data []byte) bool {
-	if agentx.ExtractCommandHash(data, agentx.DefaultStampPrefix) != "" {
-		return true
-	}
-	return strings.Contains(string(data), agentx.DefaultStampPrefix)
 }
 
 // oxRuleFiles returns the rule files to install for ox. See

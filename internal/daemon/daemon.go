@@ -184,7 +184,7 @@ type Daemon struct {
 	sessionWatcher         *agentwork.SessionWatcherManager
 	whisperRegistry        *WhisperRegistry
 	murmurNudgeSource      *MurmurNudgeSource
-	projectWatcher         *ProjectWatcher
+	projectWatcher         *GitPollWatcher
 	dbMaintenance          *DBMaintenanceScheduler
 	settingsFetcher        *SettingsFetcher
 	eventBus               *hooks.EventBus
@@ -808,7 +808,7 @@ func (d *Daemon) shutdown() error {
 // We detect liveness by pinging the daemon over its Unix socket. PID file is kept
 // as a secondary safety net for recovery scenarios (kill -9 to force-stop a hung daemon).
 //
-// See: docs/ai/analysis/february-2026-ipc-analysis.md
+// See: docs/analysis/february-2026-ipc-analysis.md
 
 // writePidFile writes the daemon PID to a file.
 func (d *Daemon) writePidFile() error {
@@ -1222,7 +1222,7 @@ func (d *Daemon) initComponents() time.Duration {
 		initialCfg := configLoader()
 		resolved := agentwork.ResolveAgent(initialCfg.GetAgent())
 		runner := agentwork.NewRunner(resolved, d.logger)
-		d.agentWorker = agentwork.NewManager(runner, d.logger, configLoader, agentWorkSignal, d.config.LedgerPath)
+		d.agentWorker = agentwork.NewManager(runner, d.logger, configLoader, agentWorkSignal, d.config.LedgerPath, d.config.ProjectRoot)
 		sfh := agentwork.NewSessionFinalizeHandler(d.logger)
 		sfh.SetPIDLookup(d.heartbeat.GetAgentPID)
 		sfh.SetLedgerMu(d.scheduler.LedgerMu())
@@ -1360,19 +1360,14 @@ func (d *Daemon) startWorkers() {
 		}
 		if d.config.ProjectRoot != "" && d.config.LedgerPath != "" {
 			accumulator := NewChangeAccumulator(3 * time.Second)
-			tracker := NewGitTrackedMatcher(d.config.ProjectRoot, d.logger)
-			d.projectWatcher = NewProjectWatcher(
-				d.config.ProjectRoot, d.logger,
-				DefaultWatcherFactory, &RealFileSystem{},
-				accumulator, tracker,
-			)
+			d.projectWatcher = NewGitPollWatcher(d.config.ProjectRoot, accumulator, d.logger)
 			murmurPub := NewFileChangeMurmurPublisher(
 				accumulator, d.service,
 				d.config.LedgerPath, d.config.ProjectRoot,
 				d.logger,
 			)
 			murmurPub.SetAgentResolver(&heartbeatAgentResolver{heartbeat: d.heartbeat})
-			// wire fsnotify-triggered dirty overlay rebuilds to codedb
+			// wire poll-triggered dirty overlay rebuilds to codedb
 			if d.codedb != nil {
 				debouncer := NewDirtyOverlayDebouncer(d.codedb, d.logger)
 				debouncer.Start(d.ctx)
@@ -1581,6 +1576,16 @@ func (s *daemonServiceImpl) Status() *StatusData {
 		}
 	}
 
+	// knowledge bubbles: scanned from disk so any daemon (owner or follower)
+	// reports what's synced. Only the global-sync owner actually writes these
+	// dirs (see sync.go:920-928), but the on-disk state is the shared truth.
+	if kbRows := s.d.scheduler.kbWorkspaceStatus(); len(kbRows) > 0 {
+		workspaces["kb"] = kbRows
+	}
+
+	globalSyncOwner := s.d.scheduler.IsGlobalSyncOwner()
+	globalSyncEndpoint := endpoint.NormalizeEndpoint(endpoint.GetForProject(s.d.config.ProjectRoot))
+
 	return &StatusData{
 		Running:            true,
 		Pid:                os.Getpid(),
@@ -1598,6 +1603,8 @@ func (s *daemonServiceImpl) Status() *StatusData {
 		AvgSyncTime:        stats.AvgDuration,
 		Workspaces:         workspaces,
 		ProjectTeamID:      projectTeamID,
+		GlobalSyncOwner:    globalSyncOwner,
+		GlobalSyncEndpoint: globalSyncEndpoint,
 		TeamContexts:       s.d.scheduler.TeamContextStatus(),
 		InactivityTimeout:  s.d.config.InactivityTimeout,
 		TimeSinceActivity:  s.d.timeSinceLastActivity(),
@@ -2061,49 +2068,61 @@ func (s *daemonServiceImpl) PublishMurmur(payload MurmurPayload) {
 	// against the workspace registry allow-list and ensure RelPath cannot escape
 	// the workspace via traversal. Internal callers (file_change_source) pass
 	// the canonical ledger path and a well-formed RelPath, so they pass naturally.
-	if !s.isAllowedWorkspaceTarget(payload.TargetDir) {
-		s.d.logger.Warn("rejected murmur: target_dir not in workspace registry",
-			"target_dir", payload.TargetDir,
-			"rel_path", payload.RelPath)
-		return
-	}
-	if err := validateMurmurRelPath(payload.TargetDir, payload.RelPath); err != nil {
-		s.d.logger.Warn("rejected murmur: rel_path validation failed",
-			"target_dir", payload.TargetDir,
-			"rel_path", payload.RelPath,
-			"error", err)
-		return
-	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-
-		// write the murmur file to disk (daemon owns all I/O)
-		if err := ledger.WriteMurmurRaw(payload.TargetDir, payload.RelPath, payload.MurmurJSON); err != nil {
-			s.d.logger.Warn("murmur write failed", "error", err, "rel_path", payload.RelPath)
-			return
+		if err := s.commitMurmur(ctx, payload); err != nil {
+			s.d.logger.Warn("murmur publish failed", "error", err, "rel_path", payload.RelPath)
 		}
-
-		if _, err := gitutil.RunGit(ctx, payload.TargetDir, "add", "--sparse", "data/murmurs/"); err != nil {
-			s.d.logger.Warn("murmur git add failed", "error", err, "target_dir", payload.TargetDir)
-			return
-		}
-
-		summary := payload.Content
-		if len(summary) > 50 {
-			summary = summary[:50] + "..."
-		}
-		// scope commit to data/murmurs/ — a bare `git commit` would sweep in any
-		// other dirty index entries (e.g., session pointer stubs written by a
-		// previous finalize), poisoning the push queue with LFS pointer blobs
-		// whose backing objects may not be in the remote LFS store.
-		if _, err := gitutil.RunGit(ctx, payload.TargetDir, "commit", "-m", fmt.Sprintf("murmur: %s", summary), "--", "data/murmurs/"); err != nil {
-			s.d.logger.Warn("murmur git commit failed", "error", err, "target_dir", payload.TargetDir)
-			return
-		}
-
-		s.d.logger.Debug("murmur written and committed", "rel_path", payload.RelPath)
 	}()
+}
+
+// commitMurmur validates, writes, git-adds and git-commits a single murmur
+// synchronously. Shared by the IPC fast path (PublishMurmur, in a goroutine) and
+// the outbox drain, which needs the synchronous form so it only removes a queued
+// file after a confirmed commit. Returns an error instead of logging so callers
+// choose how to react.
+func (s *daemonServiceImpl) commitMurmur(ctx context.Context, payload MurmurPayload) error {
+	// Trust boundary: any same-UID IPC peer can call PublishMurmur. Validate
+	// TargetDir against the workspace registry allow-list and ensure RelPath
+	// cannot escape the workspace via traversal.
+	if !s.isAllowedWorkspaceTarget(payload.TargetDir) {
+		return fmt.Errorf("target_dir not in workspace registry: %s", payload.TargetDir)
+	}
+	if err := validateMurmurRelPath(payload.TargetDir, payload.RelPath); err != nil {
+		return fmt.Errorf("rel_path validation failed: %w", err)
+	}
+	if err := writeAndCommitMurmur(ctx, payload.TargetDir, payload); err != nil {
+		return err
+	}
+	s.d.logger.Debug("murmur written and committed", "rel_path", payload.RelPath)
+	return nil
+}
+
+// writeAndCommitMurmur writes the murmur file to disk (the daemon owns all I/O)
+// and commits it, scoped to data/murmurs/. The caller MUST have already
+// validated targetDir and payload.RelPath. Shared by the IPC path and the
+// outbox drain.
+//
+// The commit is scoped to data/murmurs/ — a bare `git commit` would sweep in any
+// other dirty index entries (e.g. session pointer stubs written by a previous
+// finalize), poisoning the push queue with LFS pointer blobs whose backing
+// objects may not be in the remote LFS store.
+func writeAndCommitMurmur(ctx context.Context, targetDir string, payload MurmurPayload) error {
+	if err := ledger.WriteMurmurRaw(targetDir, payload.RelPath, payload.MurmurJSON); err != nil {
+		return fmt.Errorf("write murmur: %w", err)
+	}
+	if _, err := gitutil.RunGit(ctx, targetDir, "add", "--sparse", "data/murmurs/"); err != nil {
+		return fmt.Errorf("git add murmur: %w", err)
+	}
+	summary := payload.Content
+	if len(summary) > 50 {
+		summary = summary[:50] + "..."
+	}
+	if _, err := gitutil.RunGit(ctx, targetDir, "commit", "-m", fmt.Sprintf("murmur: %s", summary), "--", "data/murmurs/"); err != nil {
+		return fmt.Errorf("git commit murmur: %w", err)
+	}
+	return nil
 }
 
 func (s *daemonServiceImpl) PauseMurmuring(agentID string) {

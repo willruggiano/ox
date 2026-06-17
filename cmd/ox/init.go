@@ -668,6 +668,30 @@ func runInit() error {
 		}
 	}
 
+	// snapshot pre-existing instruction files for rollback BEFORE markers mutate
+	// them — trackModifiedFile reads content eagerly, so snapshotting after
+	// EnsureInstructionFileMarkers would capture the already-modified content.
+	for _, t := range DetectedInstructionFiles(gitRoot) {
+		if t.Exists {
+			tracker.trackModifiedFile(filepath.Join(gitRoot, t.Path))
+		}
+	}
+
+	// inject ox:prime markers into all detected agent instruction files (multi-platform)
+	instrResults, instrErr := EnsureInstructionFileMarkers(gitRoot)
+	if instrErr != nil {
+		slog.Warn("failed to inject instruction file markers", "error", instrErr)
+	} else {
+		for _, r := range instrResults {
+			slog.Debug("instruction file marker", "file", r.File, "status", r.Status, "agent", r.AgentType)
+			// only newly-created files need create-tracking; pre-existing files
+			// were already snapshotted for rollback above
+			if r.Status == injectedNew {
+				tracker.trackCreatedFile(filepath.Join(gitRoot, r.File))
+			}
+		}
+	}
+
 	// detect and install agent hooks
 	installedHooks := installAgentHooks(gitRoot, true, selectedAgents) // quiet — summarized below
 	for _, hookFile := range installedHooks {
@@ -1895,10 +1919,38 @@ func installAgentHooks(gitRoot string, quiet bool, selectedAgents map[string]boo
 					cli.PrintWarning(fmt.Sprintf("Could not install %s commands: %v", ea.Name(), err))
 				}
 			} else if result.Installed {
-				if !quiet {
-					cli.PrintSuccess(fmt.Sprintf("Installed %s commands", ea.Name()))
+				// FilesWritten holds only the commands actually (over)written;
+				// it's empty when every command was already current. Report the
+				// honest count instead of an unconditional "Installed".
+				if n := len(result.FilesWritten); n > 0 {
+					if !quiet {
+						cli.PrintSuccess(fmt.Sprintf("Installed %d %s commands", n, ea.Name()))
+					}
+					installedHooks = append(installedHooks, result.FilesWritten...)
+				} else if !quiet {
+					cli.PrintPreserved(fmt.Sprintf("%s commands already up to date", ea.Name()))
 				}
-				installedHooks = append(installedHooks, result.FilesWritten...)
+			}
+		}
+
+		if ea.HasCapability(adapterprotocol.CapSkillsInstaller) {
+			result, err := ea.InstallSkills(gitRoot, version.Version)
+			if err != nil {
+				if !quiet {
+					cli.PrintWarning(fmt.Sprintf("Could not install %s skills: %v", ea.Name(), err))
+				}
+			} else if result.Installed {
+				// FilesWritten holds only the skills actually (over)written; it's
+				// empty when every skill was already current. Report the honest
+				// count instead of an unconditional "Installed".
+				if n := len(result.FilesWritten); n > 0 {
+					if !quiet {
+						cli.PrintSuccess(fmt.Sprintf("Installed %d %s skills", n, ea.Name()))
+					}
+					installedHooks = append(installedHooks, result.FilesWritten...)
+				} else if !quiet {
+					cli.PrintPreserved(fmt.Sprintf("%s skills already up to date", ea.Name()))
+				}
 			}
 		}
 	}

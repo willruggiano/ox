@@ -127,6 +127,14 @@ func (db *DB) ParseComments(ctx context.Context, progress func(string)) (index.C
 	return index.ParseComments(ctx, db.store, index.ProgressFunc(progress))
 }
 
+// BackfillSymbolEdges populates ADR-019 symbol_edges for blobs that were
+// parsed before the resolver landed (or before a resolver version bump).
+// Idempotent and cheap (pure SQL, no tree-sitter); daemons call it after
+// every index pass so codedbs upgrade without operator action.
+func (db *DB) BackfillSymbolEdges(ctx context.Context, progress func(string)) (index.BackfillStats, error) {
+	return index.BackfillSymbolEdges(ctx, db.store, index.ProgressFunc(progress))
+}
+
 // IndexGitHubData reads PR/issue JSON files from the ledger and indexes them into CodeDB.
 func (db *DB) IndexGitHubData(ctx context.Context, ledgerPath string, progress func(string)) (*index.GitHubIndexStats, error) {
 	return index.IndexGitHubData(ctx, db.store, ledgerPath, index.ProgressFunc(progress))

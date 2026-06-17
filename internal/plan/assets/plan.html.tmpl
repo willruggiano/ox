@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>{{.Title}}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<style>{{.CSS}}</style>
+</head>
+<body data-slug="{{.Slug}}" data-review-endpoint="{{.ReviewEndpoint}}" data-review-token="{{.ReviewToken}}">
+<!-- SageOx OX icon, two-tone outlined (Space Grotesk). Defined once; markers <use> it
+     so the page stays lean and self-contained. Dark/light variants toggle via CSS. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+<symbol id="ox-ico-d" viewBox="0 0 120 120"><path d="M32.6 88.1C47.0 88.1 56.2 79.9 56.2 65.2V51.4C56.2 36.7 47.0 28.5 32.6 28.5C18.1 28.5 9.0 36.7 9.0 51.4V65.2C9.0 79.9 18.1 88.1 32.6 88.1ZM32.6 78.5C24.5 78.5 19.8 73.4 19.8 65.5V51.1C19.8 43.2 24.5 38.1 32.6 38.1C40.6 38.1 45.4 43.2 45.4 51.1V65.5C45.4 73.4 40.6 78.5 32.6 78.5Z" fill="#c4d1c0" stroke="#c4d1c0" stroke-width="3" paint-order="stroke fill"/><path d="M62.1 87.0H74.4L86.0 65.8H87.5L99.0 87.0H111.3L94.5 58.1L111.2 29.6H98.9L87.5 50.3H86.0L74.6 29.6H62.3L78.9 58.1Z" fill="#7a8f78" stroke="#7a8f78" stroke-width="3" paint-order="stroke fill"/></symbol>
+<symbol id="ox-ico-l" viewBox="0 0 120 120"><path d="M32.6 88.1C47.0 88.1 56.2 79.9 56.2 65.2V51.4C56.2 36.7 47.0 28.5 32.6 28.5C18.1 28.5 9.0 36.7 9.0 51.4V65.2C9.0 79.9 18.1 88.1 32.6 88.1ZM32.6 78.5C24.5 78.5 19.8 73.4 19.8 65.5V51.1C19.8 43.2 24.5 38.1 32.6 38.1C40.6 38.1 45.4 43.2 45.4 51.1V65.5C45.4 73.4 40.6 78.5 32.6 78.5Z" fill="#aebca7" stroke="#aebca7" stroke-width="3" paint-order="stroke fill"/><path d="M62.1 87.0H74.4L86.0 65.8H87.5L99.0 87.0H111.3L94.5 58.1L111.2 29.6H98.9L87.5 50.3H86.0L74.6 29.6H62.3L78.9 58.1Z" fill="#546a54" stroke="#546a54" stroke-width="3" paint-order="stroke fill"/></symbol>
+</defs></svg>
+<button class="toggle" id="themeBtn" title="Toggle light/dark">◐</button>
+<div class="shell">
+<nav class="toc">
+  <div class="brand">OX · PLAN</div>
+  <div class="toc-links">{{range .TOC}}<a href="#{{.ID}}"><span class="n">{{.Num}}</span>{{.Heading}}</a>
+  {{end}}</div>
+  {{if .FooterCredit}}<div class="toc-brand" title="Team context enriched by SageOx">
+    <span class="wm wm-d">{{.WordmarkDark}}</span><span class="wm wm-l">{{.WordmarkLight}}</span>
+    <span class="toc-brand-cap">enriched by SageOx</span>
+  </div>{{end}}
+</nav>
+<main>
+  <div class="eyebrow">SageOx · enriched plan</div>
+  <h1>{{.Title}}</h1>
+  {{if .HasSignals}}<div class="ox-enrich">
+    <button class="ox-marker" aria-label="SageOx insight" title="SageOx team-context signals"><svg class="ox-ico" aria-hidden="true"><use href="#ox-ico-d" class="ico-d"></use><use href="#ox-ico-l" class="ico-l"></use></svg></button>
+    <div>
+      <strong>Team context enriched by SageOx</strong> — {{.SignalCount}} deterministic signal{{.Plural}} on this plan{{if .Sections}}, anchored to the sections they affect{{end}}.
+      {{if .Signals}}<ul>{{range .Signals}}<li><span class="ox-sig-{{.Type}}">{{.Label}}</span> — {{.Why}}{{if .Source}} <span class="src">{{.Source}}</span>{{end}}</li>
+      {{end}}</ul>{{end}}
+    </div>
+  </div>{{end}}
+  {{if .Review.HasReview}}<div class="rev-status"><span class="rev-status-tag">Review</span> <strong>{{.Review.Open}}</strong> open · {{.Review.Addressed}} addressed · {{.Review.Verified}} verified{{if .Review.Wontfix}} · {{.Review.Wontfix}} won't-fix{{end}}</div>{{end}}
+  {{if .TLDR}}<div class="tldr"><span class="tldr-tag">TL;DR</span>{{.TLDR}}</div>{{end}}
+  {{if .Preamble}}<section id="preamble">{{.Preamble}}</section>{{end}}
+  {{range .Sections}}<section id="{{.ID}}"{{if .IsRisk}} class="risk"{{end}}>
+    <h2>{{.Heading}}</h2>
+    {{if .Signals}}<div class="ox-rail">{{range .Signals}}<span class="ox-chip ox-sig-{{.Type}}"><button class="ox-marker sm" aria-label="SageOx insight" title="SageOx signal"><svg class="ox-ico" aria-hidden="true"><use href="#ox-ico-d" class="ico-d"></use><use href="#ox-ico-l" class="ico-l"></use></svg></button> <strong>{{.Label}}</strong> — {{.Why}}{{if .Source}} <span class="src">{{.Source}}</span>{{end}}</span>{{end}}</div>{{end}}
+    {{.HTML}}
+  </section>
+  {{end}}
+  <div class="foot">{{if .ReviewEndpoint}}<span class="foot-live">Live review loop · powered by SageOx</span> · {{end}}{{if .FooterCredit}}Team context enriched by SageOx · {{end}}Rendered by <code>ox plan</code> · SageOx — self-contained, agent-agnostic.</div>
+</main>
+</div>
+<script type="application/json" id="ox-review-state">{{.ReviewJSON}}</script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11.6.0/dist/mermaid.min.js" integrity="sha384-zkWMJO4sgpPUzyuOgDx8HB/K55glbAwajEpk1Go2NWRuPkPA/wIhoEJTuSkmOYrV" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script>{{.JS}}</script>
+<script>{{.ReviewJS}}</script>
+</body>
+</html>

@@ -9,11 +9,11 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/sageox/ox/internal/envutil"
 	"github.com/sageox/ox/pkg/adapterprotocol"
 	"github.com/sageox/ox/pkg/adapterruntime"
 	"github.com/sageox/ox/pkg/ndjson"
@@ -33,29 +33,6 @@ var (
 	ErrProtocolMismatch = errors.New("adapter protocol version mismatch")
 )
 
-// allowlistedEnvVars are exact-match variable names always passed to adapter processes.
-var allowlistedEnvVars = map[string]bool{
-	"HOME":   true,
-	"PATH":   true,
-	"TMPDIR": true,
-}
-
-// allowlistedEnvPrefixes are prefix patterns; any variable starting with these is passed through.
-var allowlistedEnvPrefixes = []string{
-	"XDG_",
-}
-
-// denylistedEnvPatterns are substrings that block adapter-declared required_env vars.
-// Prevents adapters from requesting sensitive credentials via self-declared required_env.
-var denylistedEnvPatterns = []string{
-	"SECRET",
-	"TOKEN",
-	"KEY",
-	"PASSWORD",
-	"CREDENTIAL",
-	"PRIVATE",
-}
-
 // ExternalAdapter implements Adapter and IncrementalReader by calling an
 // external adapter binary via subprocess (one-shot) or serve-mode pipe.
 type ExternalAdapter struct {
@@ -66,7 +43,6 @@ type ExternalAdapter struct {
 	serveMu  sync.Mutex
 	serveCmd *exec.Cmd
 	serveIn  io.WriteCloser
-	serveOut *ndjson.Scanner
 	serveEnc *ndjson.Encoder
 	serveSeq int
 
@@ -497,6 +473,51 @@ func (ea *ExternalAdapter) UninstallCommands(repoRoot, version string) (*adapter
 	return &result, nil
 }
 
+// InstallSkills calls the adapter's install-skills subcommand.
+func (ea *ExternalAdapter) InstallSkills(repoRoot, version string) (*adapterprotocol.InstallSkillsResponse, error) {
+	out, err := ea.execOneShot("install-skills", "--repo-root", repoRoot, "--version", version)
+	if err != nil {
+		return nil, err
+	}
+
+	var result adapterprotocol.InstallSkillsResponse
+	if err := json.Unmarshal(out, &result); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, err)
+	}
+
+	return &result, nil
+}
+
+// CheckSkills calls the adapter's check-skills subcommand.
+func (ea *ExternalAdapter) CheckSkills(repoRoot, version string) (*adapterprotocol.CheckSkillsResponse, error) {
+	out, err := ea.execOneShot("check-skills", "--repo-root", repoRoot, "--version", version)
+	if err != nil {
+		return nil, err
+	}
+
+	var result adapterprotocol.CheckSkillsResponse
+	if err := json.Unmarshal(out, &result); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, err)
+	}
+
+	return &result, nil
+}
+
+// UninstallSkills calls the adapter's uninstall-skills subcommand.
+func (ea *ExternalAdapter) UninstallSkills(repoRoot, version string) (*adapterprotocol.UninstallSkillsResponse, error) {
+	out, err := ea.execOneShot("uninstall-skills", "--repo-root", repoRoot, "--version", version)
+	if err != nil {
+		return nil, err
+	}
+
+	var result adapterprotocol.UninstallSkillsResponse
+	if err := json.Unmarshal(out, &result); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, err)
+	}
+
+	return &result, nil
+}
+
 // --- internal helpers ---
 
 func (ea *ExternalAdapter) callInfo() (*adapterprotocol.InfoResponse, error) {
@@ -586,86 +607,7 @@ func (ea *ExternalAdapter) buildEnv() []string {
 	if ea.info != nil {
 		requiredEnv = ea.info.RequiredEnv
 	}
-	return SanitizedEnv(os.Environ(), requiredEnv)
-}
-
-// SanitizedEnv builds a sanitized environment for adapter subprocess execution.
-// It filters environ (typically os.Environ()) to only include:
-//   - Exact-match allowlisted vars: HOME, PATH, TMPDIR
-//   - Prefix-match allowlisted vars: XDG_*
-//   - OX_* protocol vars (OX_PROTOCOL_VERSION, OX_REPO_ROOT, OX_REPO_ID, OX_TEAM_ID)
-//   - Any additional vars declared in the adapter's required_env list
-//
-// All other variables (API keys, tokens, secrets) are stripped.
-func SanitizedEnv(environ []string, requiredEnv []string) []string {
-	// build a set of adapter-declared required env var names, filtering out
-	// names that match sensitive patterns to prevent credential exfiltration
-	required := make(map[string]bool, len(requiredEnv))
-	for _, name := range requiredEnv {
-		if isDenylisted(name) {
-			continue
-		}
-		required[name] = true
-	}
-
-	env := make([]string, 0, len(allowlistedEnvVars)+len(requiredEnv)+4)
-
-	// track which OX_ vars we found so we can inject defaults for missing ones
-	foundOX := make(map[string]bool)
-
-	for _, entry := range environ {
-		name, _, ok := strings.Cut(entry, "=")
-		if !ok {
-			continue
-		}
-
-		if isAllowlisted(name) || required[name] {
-			env = append(env, entry)
-		}
-
-		// track OX_ vars we see (they pass through isAllowlisted via the OX_ prefix check)
-		if strings.HasPrefix(name, "OX_") {
-			foundOX[name] = true
-		}
-	}
-
-	// always inject OX_PROTOCOL_VERSION if not already present
-	if !foundOX["OX_PROTOCOL_VERSION"] {
-		env = append(env, fmt.Sprintf("OX_PROTOCOL_VERSION=%d", adapterprotocol.ProtocolVersion))
-	}
-
-	return env
-}
-
-// isDenylisted returns true if the variable name contains a sensitive pattern.
-// Used to prevent adapter-declared required_env from requesting credentials.
-func isDenylisted(name string) bool {
-	upper := strings.ToUpper(name)
-	for _, pattern := range denylistedEnvPatterns {
-		if strings.Contains(upper, pattern) {
-			return true
-		}
-	}
-	return false
-}
-
-// isAllowlisted returns true if the variable name matches the allowlist.
-func isAllowlisted(name string) bool {
-	if allowlistedEnvVars[name] {
-		return true
-	}
-	// OX_* protocol vars are always passed through — EXCEPT names matching
-	// the credential denylist, which must never leak to
-	// adapter subprocesses regardless of prefix.
-	if strings.HasPrefix(name, "OX_") {
-		return !isDenylisted(name)
-	}
-	for _, prefix := range allowlistedEnvPrefixes {
-		if strings.HasPrefix(name, prefix) {
-			return true
-		}
-	}
-	return false
+	return envutil.SanitizedEnv(os.Environ(), requiredEnv)
 }
 
 // protocolToInternal converts protocol RawEntry slice to internal RawEntry slice.

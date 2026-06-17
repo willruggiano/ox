@@ -83,6 +83,13 @@ Use the session:
   ox agent <agent_id> session abort         # Discard active session (destructive)
   ox agent <agent_id> session delete <name> # Delete a completed session (destructive)
 
+Execute scheduled work (run each in a fresh-context subagent):
+  ox agent <agent_id> tasks list           # List ready agent tasks
+  ox agent <agent_id> tasks next           # Claim the top ready task
+  ox agent <agent_id> tasks done <task-id> # Mark a task completed
+  ox agent <agent_id> tasks cancel <task-id> # Mark a task canceled
+  ox agent <agent_id> tasks extend <task-id> # Extend the lease on long work
+
 Stay in sync during long tasks:
   ox agent <agent_id> heartbeat            # Send heartbeat + receive pending whispers
 
@@ -537,6 +544,8 @@ func runWithAgentID(cmd *cobra.Command, agentID string, args []string) error {
 		default:
 			return fmt.Errorf("unknown session command: %s\nAvailable: start, stop, abort, pause, resume, delete, log, remind, summarize, record, plan, context-trace, import, capture-prior, subagent-complete, subagent-list, recover", sessionCmd)
 		}
+	case "tasks":
+		return runAgentTasks(cmd.OutOrStdout(), inst, subargs)
 	case "query":
 		return runAgentQuery(inst, subargs)
 	case "distill":
@@ -559,7 +568,7 @@ func runWithAgentID(cmd *cobra.Command, agentID string, args []string) error {
 	case "hook":
 		return runAgentHook(subargs)
 	default:
-		available := "doctor, heartbeat, hook, query, session, whisper"
+		available := "doctor, heartbeat, hook, query, session, tasks, whisper"
 		if auth.IsMemoryEnabled() {
 			available = "distill, " + available
 		}
@@ -889,6 +898,13 @@ func runAgentList(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Printf("    %-18s %s\n", dim.Render("Total"), dim.Render("~"+status.FormatTokenCount(int(sumTotal))))
 		fmt.Println(dim.Render("  SageOx is judged on the sageox bucket; other sources reflect authoring choices."))
+	}
+
+	// scheduled agent tasks waiting for a coworker to pick up
+	if ready, inProgress := countAgentTasks(projectRoot); ready > 0 || inProgress > 0 {
+		fmt.Println()
+		fmt.Printf("Agent tasks: %s\n",
+			dim.Render(fmt.Sprintf("%d ready, %d in progress  (ox agent <id> tasks list)", ready, inProgress)))
 	}
 
 	return nil

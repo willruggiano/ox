@@ -152,9 +152,16 @@ const (
 	// Agent Health checks
 	CheckSlugInstanceStale       = "instance-stale"
 	CheckSlugDaemonInstanceStale = "daemon-instance-stale"
+	CheckSlugAgentTasksStuck     = "agent-tasks-stuck"
 
 	// Command checks
 	CheckSlugClaudeCommands = "claude-commands"
+
+	// Skill checks
+	CheckSlugClaudeSkills = "claude-skills"
+
+	// Rules checks
+	CheckSlugAdapterRules = "adapter-rules"
 
 	// Session checks
 	CheckSlugSessionCommit      = "session-commit"
@@ -207,6 +214,15 @@ const (
 	CheckSlugKBStaleSync       = "kb-stale-sync"
 	// CheckSlugKBProjectConfigMigrate is co-located with its impl in
 	// doctor_kb_migrate.go to keep the v1 migration check self-contained.
+
+	// Knowledge-bubble repo-health checks — parity with ledger/team-context
+	// git-repo doctoring. A bubble is a daemon-managed git checkout like a
+	// ledger, so the same wedge/sparse/sync failure modes apply. Repairs kick
+	// the daemon (which owns kb git writes) rather than mutating the tree from
+	// the CLI. See doctor_kb_repo_health.go and docs/specs/kb-daemon-sync.md.
+	CheckSlugKBMissingClone   = "kb-missing-clone"
+	CheckSlugKBWedged         = "kb-wedged"
+	CheckSlugKBSparseCheckout = "kb-sparse-checkout"
 
 	// Global-sync leader-election checks (ox-6zme)
 	CheckSlugKBGlobalSyncNoOwner = "kb-global-sync-no-owner"

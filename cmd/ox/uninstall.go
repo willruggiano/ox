@@ -621,53 +621,6 @@ func formatBytes(bytes int64) string {
 	}
 }
 
-// confirmUninstall prompts user for confirmation
-// returns true if user confirms, false otherwise
-// Deprecated: use confirmUninstallWithInput instead
-func confirmUninstall() bool {
-	// get repo name for confirmation
-	gitRoot, err := repotools.FindRepoRoot(repotools.VCSGit)
-	if err != nil {
-		slog.Error("failed to find repo root for confirmation", "error", err)
-		return false
-	}
-	repoName := filepath.Base(gitRoot)
-
-	fmt.Fprintln(os.Stderr)
-	fmt.Println(cli.StyleError.Bold(true).Render("DANGER ZONE"))
-	fmt.Fprintln(os.Stderr)
-	fmt.Println(cli.StyleWarning.Render("You are about to permanently uninstall SageOx from this repository."))
-	fmt.Fprintln(os.Stderr)
-	fmt.Println("This will:")
-	fmt.Println(cli.StyleError.Render("  • Delete .sageox/ directory and all session history"))
-	fmt.Println(cli.StyleError.Render("  • Remove SageOx git hooks"))
-	fmt.Println(cli.StyleError.Render("  • Clean up AGENTS.md/CLAUDE.md references"))
-	fmt.Fprintln(os.Stderr)
-	fmt.Println(cli.StyleError.Bold(true).Render("This affects ALL users of this repository, not just you."))
-	fmt.Fprintln(os.Stderr)
-	fmt.Printf("To confirm, type the repository name: %s\n", cli.StyleCommand.Render(repoName))
-	fmt.Fprintln(os.Stderr)
-	fmt.Print("> ")
-
-	reader := bufio.NewReader(os.Stdin)
-	input, err := reader.ReadString('\n')
-	if err != nil {
-		slog.Error("failed to read confirmation input", "error", err)
-		return false
-	}
-
-	input = strings.TrimSpace(input)
-	if input != repoName {
-		fmt.Fprintln(os.Stderr)
-		fmt.Println(cli.StyleError.Render("Confirmation failed."))
-		fmt.Printf("Expected: %s, got: %s\n", repoName, input)
-		return false
-	}
-
-	slog.Info("uninstall confirmed", "repo", repoName)
-	return true
-}
-
 // removeSageoxDir removes the .sageox directory
 func removeSageoxDir(gitRoot string) error {
 	slog.Info("removing .sageox directory", "git_root", gitRoot)
@@ -736,15 +689,24 @@ func cleanupAgentFiles(gitRoot string) error {
 				slog.Warn("failed to remove rules", "adapter", ea.Name(), "error", err)
 			}
 		}
+		if ea.HasCapability(adapterprotocol.CapSkillsInstaller) {
+			if uninstallDryRun {
+				slog.Info("would remove skills", "adapter", ea.Name())
+			} else if _, err := ea.UninstallSkills(gitRoot, ""); err != nil {
+				slog.Warn("failed to remove skills", "adapter", ea.Name(), "error", err)
+			}
+		}
 	}
 
-	// TODO: implement cleanup for other agent integrations:
-	// - .claude/settings.json (project-level shared hooks, use existing hooks_claude.go helpers)
-	// - .opencode/plugin/ox-prime.ts (project-level, use existing hooks_opencode.go helpers)
-	// - .cursorrules (SageOx sections if any)
-	// - .windsurfrules (SageOx sections if any)
-	// must preserve user content, only remove SageOx additions
-	slog.Debug("cleanupAgentFiles", "git_root", gitRoot, "status", "partial implementation")
+	// remove ox:prime markers from all known agent instruction files
+	removeResults, removeErr := RemoveInstructionFileMarkers(gitRoot)
+	if removeErr != nil {
+		slog.Warn("failed to remove instruction file markers", "error", removeErr)
+	} else {
+		for _, r := range removeResults {
+			slog.Debug("instruction file marker removal", "file", r.File, "status", r.Status, "agent", r.AgentType)
+		}
+	}
 	return nil
 }
 

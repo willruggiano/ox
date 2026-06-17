@@ -25,6 +25,7 @@
     "Returns": "BatchIterator",
     "Depth": 0,
     "CommentKind": "",
-    "State": ""
+    "State": "",
+    "Confidence": ""
   }
 }

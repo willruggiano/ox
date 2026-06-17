@@ -1,5 +1,7 @@
 // Package ledgersearch provides zero-network, local-only full-text search over
-// the cached ledger contents: session summaries/markdown and recent murmurs.
+// the cached ledger contents: session summaries/markdown, recent murmurs, and
+// captured plans (data/plans/<dated-slug>/plan.md). Including plans closes the
+// prior-art flywheel — a plan saved by `ox plan` resurfaces in future plans.
 //
 // Design choice (see ox-m01h): this is an in-memory grep over a bounded window
 // of recent files rather than a persistent bleve index. Rationale:
@@ -40,6 +42,12 @@ const MaxSessionAge = 90 * 24 * time.Hour
 // the last 12 hours hydrated; we scan a slightly wider window to be safe.
 const MaxMurmurAge = 7 * 24 * time.Hour
 
+// MaxPlanAge bounds how far back we scan captured plans. Plans are the prior-art
+// flywheel's highest-signal corpus (a saved plan should resurface in future
+// plans), so we keep the same generous window as sessions rather than the
+// tighter murmur window.
+const MaxPlanAge = 90 * 24 * time.Hour
+
 // DefaultLimit is returned when callers pass limit <= 0.
 const DefaultLimit = 5
 
@@ -52,13 +60,14 @@ type Result struct {
 	Score float64 `json:"score"`
 	// Text is a short snippet around the matched term.
 	Text string `json:"text"`
-	// DocType is "session" or "murmur".
+	// DocType is "session", "murmur", or "plan".
 	DocType string `json:"doc_type"`
 	// FilePath is the absolute on-disk path of the source file.
 	FilePath string `json:"file_path"`
 	// SourceType is "ledger" — distinguishes from team-context results when merged.
 	SourceType string `json:"source_type"`
-	// SourceID is the session folder name or murmur ID.
+	// SourceID is the session folder name, murmur ID, or plan folder name
+	// (the dated slug, e.g. "2026-06-03-add-cache" — usable to locate the plan).
 	SourceID string `json:"source_id"`
 	// CreatedAt is the source's timestamp (ISO 8601). Empty if unknown.
 	CreatedAt string `json:"created_at,omitempty"`
@@ -113,6 +122,7 @@ func Search(opts Options) ([]Result, error) {
 	var results []Result
 	results = append(results, scanSessions(opts.LedgerPath, terms, now)...)
 	results = append(results, scanMurmurs(opts.LedgerPath, terms, now)...)
+	results = append(results, scanPlans(opts.LedgerPath, terms, now)...)
 
 	// sort by score desc, ties broken by recency desc
 	sort.SliceStable(results, func(i, j int) bool {
@@ -270,6 +280,84 @@ func scanMurmurs(ledgerPath string, terms []string, now time.Time) []Result {
 	return results
 }
 
+// scanPlans walks data/plans/<YYYY-MM-DD-slug>/ and scores plan.md hits. This
+// closes the prior-art flywheel: a plan saved by `ox plan` must resurface as
+// prior art in future plans. Mirrors scanSessions — same TF scoring, same age
+// filter, same Result shape — but reads the canonical plan.md (always plain
+// git, never an LFS pointer) and pulls created_at from meta.json when present.
+// Fail-open: a missing data/plans/ dir yields no results, never an error.
+func scanPlans(ledgerPath string, terms []string, now time.Time) []Result {
+	plansDir := filepath.Join(ledgerPath, "data", "plans")
+	entries, err := os.ReadDir(plansDir)
+	if err != nil {
+		// missing dir (no plans saved yet) or unreadable — fail open.
+		return nil
+	}
+
+	cutoff := now.Add(-MaxPlanAge)
+	var results []Result
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		planPath := filepath.Join(plansDir, name)
+
+		// created_at comes from meta.json (authoritative); fall back to the
+		// dated dir-name prefix when meta is missing/partial so age filtering
+		// and recency tiebreaks still work on a partial plan dir.
+		ts := planTimestamp(planPath, name)
+		if !ts.IsZero() && ts.Before(cutoff) {
+			continue
+		}
+
+		// plan.md is the canonical plan text — always plain git, the same role
+		// summary.md plays for sessions.
+		path := filepath.Join(planPath, "plan.md")
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			continue
+		}
+		score, snippet := scoreContent(string(data), terms)
+		if score <= 0 {
+			continue
+		}
+		results = append(results, Result{
+			Score:      score,
+			Text:       snippet,
+			DocType:    "plan",
+			FilePath:   path,
+			SourceType: "ledger",
+			SourceID:   name, // dated slug — locates the plan via `ox plan view`
+			CreatedAt:  ts.Format(time.RFC3339),
+		})
+	}
+	return results
+}
+
+// planTimestamp resolves a plan's created_at, preferring meta.json's explicit
+// timestamp and falling back to the YYYY-MM-DD prefix of the dir name. Returns
+// zero time when neither is available — callers treat that as "include".
+func planTimestamp(planPath, dirName string) time.Time {
+	metaPath := filepath.Join(planPath, "meta.json")
+	if data, err := os.ReadFile(metaPath); err == nil {
+		var m struct {
+			CreatedAt time.Time `json:"created_at"`
+		}
+		if json.Unmarshal(data, &m) == nil && !m.CreatedAt.IsZero() {
+			return m.CreatedAt
+		}
+	}
+	// fall back to the dated dir-name prefix "YYYY-MM-DD-<slug>".
+	if len(dirName) >= 10 {
+		if t, err := time.Parse("2006-01-02", dirName[:10]); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
 // scoreContent returns a relevance score and a short snippet for content matching all terms.
 // Score = (matched-term-count / total-terms) + tf-bonus capped at 1.0.
 // Snippet is the first ~160 chars around the first matched term.
@@ -318,9 +406,13 @@ func scoreContent(content string, terms []string) (float64, string) {
 	return score, snippetAround(content, firstIdx, 160)
 }
 
-// snippetAround returns a window of size chars around idx, trimmed at whitespace.
+// snippetAround returns a readable window of about size bytes centered on idx,
+// with both edges snapped to whole-word boundaries so the snippet never begins
+// or ends mid-word. Elided ends are marked with "...". Snapping at ASCII
+// whitespace is also UTF-8 safe: multi-byte runes never contain a byte < 0x80,
+// so a cut at a space can't split a rune.
 func snippetAround(s string, idx, size int) string {
-	if idx < 0 {
+	if idx < 0 || s == "" {
 		return ""
 	}
 	start := idx - size/2
@@ -331,17 +423,74 @@ func snippetAround(s string, idx, size int) string {
 	if end > len(s) {
 		end = len(s)
 	}
-	out := s[start:end]
-	out = strings.TrimSpace(out)
-	// collapse internal whitespace runs for compact display
+
+	elidedLeft := start > 0
+	elidedRight := end < len(s)
+
+	wStart, wEnd := start, end
+	if elidedLeft {
+		// drop the partial leading word, then advance onto the next word start
+		for wStart < wEnd && !isASCIISpace(s[wStart]) {
+			wStart++
+		}
+		for wStart < wEnd && isASCIISpace(s[wStart]) {
+			wStart++
+		}
+	}
+	if elidedRight {
+		// retreat to the end of the last whole word inside the window
+		for wEnd > wStart && !isASCIISpace(s[wEnd-1]) {
+			wEnd--
+		}
+		for wEnd > wStart && isASCIISpace(s[wEnd-1]) {
+			wEnd--
+		}
+	}
+	// degenerate case: a single token longer than the window collapsed it —
+	// fall back to a rune-safe cut so we still show something.
+	if wStart >= wEnd {
+		wStart = alignRuneStart(s, start)
+		wEnd = alignRuneStart(s, end)
+		if wEnd < wStart {
+			wEnd = wStart
+		}
+	}
+
+	out := strings.TrimSpace(s[wStart:wEnd])
 	out = strings.Join(strings.Fields(out), " ")
-	if start > 0 {
+	if out == "" {
+		return ""
+	}
+	if elidedLeft {
 		out = "..." + out
 	}
-	if end < len(s) {
+	if elidedRight {
 		out = out + "..."
 	}
 	return out
+}
+
+// isASCIISpace reports whether b is an ASCII whitespace byte. Used for word-
+// boundary snapping where only single-byte ASCII spaces are valid cut points.
+func isASCIISpace(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r', '\f', '\v':
+		return true
+	default:
+		return false
+	}
+}
+
+// alignRuneStart moves i back to the start of the UTF-8 rune it lands inside,
+// so a fallback byte-slice never splits a multi-byte rune.
+func alignRuneStart(s string, i int) int {
+	if i >= len(s) {
+		return len(s)
+	}
+	for i > 0 && s[i]&0xC0 == 0x80 {
+		i--
+	}
+	return i
 }
 
 // parseSessionTimestamp pulls the prefix from "YYYY-MM-DDTHH-MM-<user>-<id>".

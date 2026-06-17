@@ -22,6 +22,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -1434,6 +1435,10 @@ func (s *SyncScheduler) doPull(ctx context.Context, progress *ProgressWriter, fo
 		}
 	}
 
+	// write+commit any murmurs the CLI queued while the daemon was down, so they
+	// are relayed and pushed in this same cycle
+	s.drainMurmurOutbox(ctx)
+
 	// relay murmurs from ledger after pull
 	if s.murmurRelay != nil {
 		if l := s.workspaceRegistry.GetLedger(); l != nil && l.Path != "" {
@@ -1453,6 +1458,58 @@ func (s *SyncScheduler) doPull(ctx context.Context, progress *ProgressWriter, fo
 	}
 	s.logger.Debug("pull complete", "duration", duration)
 	return nil
+}
+
+// drainMurmurOutbox writes and commits any murmurs the CLI queued locally while
+// the daemon was unavailable. It runs at the top of each ledger sync so a drained
+// murmur is relayed and pushed in the same cycle. Entries older than the murmur
+// window are dropped rather than resurfaced. Best-effort: a commit failure leaves
+// the queued file in place for the next cycle.
+//
+// Each workspace in the registry is its own allow-list entry, so the registry
+// path (not the file's stored TargetDir) is used as the trusted commit target.
+func (s *SyncScheduler) drainMurmurOutbox(ctx context.Context) {
+	if s.workspaceRegistry == nil {
+		return
+	}
+	cutoff := time.Now().UTC().Add(-time.Duration(ledger.MaxMurmurWindowHours) * time.Hour)
+	for _, ws := range s.workspaceRegistry.GetAllWorkspaces() {
+		if ws.Path == "" {
+			continue
+		}
+		entries, err := ReadOutboxMurmurs(ws.Path)
+		if err != nil {
+			s.logger.Debug("murmur outbox read failed", "path", ws.Path, "error", err)
+			continue
+		}
+		for _, e := range entries {
+			// trust the registry path, not the file's stored TargetDir
+			payload := e.payload
+			payload.TargetDir = ws.Path
+
+			// defensive traversal check on the stored RelPath
+			if err := validateMurmurRelPath(payload.TargetDir, payload.RelPath); err != nil {
+				s.logger.Warn("dropping malformed queued murmur", "path", e.path, "error", err)
+				_ = RemoveOutboxMurmur(e.path)
+				continue
+			}
+
+			// drop stale murmurs (older than the 24h window) so old WIP never resurfaces
+			var mf ledger.MurmurFile
+			if json.Unmarshal(payload.MurmurJSON, &mf) == nil && !mf.Timestamp.IsZero() && mf.Timestamp.Before(cutoff) {
+				s.logger.Debug("dropping stale queued murmur", "path", e.path, "ts", mf.Timestamp)
+				_ = RemoveOutboxMurmur(e.path)
+				continue
+			}
+
+			if err := writeAndCommitMurmur(ctx, payload.TargetDir, payload); err != nil {
+				s.logger.Warn("queued murmur commit failed (will retry)", "path", e.path, "error", err)
+				continue // leave for next cycle
+			}
+			s.logger.Debug("drained queued murmur", "path", e.path, "rel_path", payload.RelPath)
+			_ = RemoveOutboxMurmur(e.path)
+		}
+	}
 }
 
 // pushMurmurCommits pushes any local murmur commits to the ledger remote.
@@ -1703,7 +1760,7 @@ func isValidRepoPath(path string) bool {
 // ┌─────────────────────────────────────────────────────────────────────────────┐
 // │ DAEMON IPC HANDLER: checkout                                                │
 // │ Classification: CRITICAL PATH WITH FALLBACK                                 │
-// │ (see docs/ai/specs/ipc-architecture.md)                                     │
+// │ (see docs/specs/ipc-architecture.md)                                     │
 // │                                                                             │
 // │ Clone is CRITICAL for product functionality - without it, SageOx cannot     │
 // │ be initialized at all. However, IPC to this handler is NOT strictly         │
@@ -1886,14 +1943,10 @@ func (s *SyncScheduler) Checkout(payload CheckoutPayload, progress *ProgressWrit
 			_ = progress.WriteStage("cloning", "Cloning repository...")
 		}
 		// Per ox-eeqi: clone with ox-managed credential helper, not embedded
-		// URL credentials. `-c credential.helper=` empty clears inherited
-		// helpers; the second `-c` installs ours for this single invocation.
-		helperCmd := gitserver.DefaultHelperCommand()
-		preArgs := []string{
-			"-c", "credential.helper=",
-			"-c", "credential.helper=" + helperCmd,
-		}
-		cloneArgs := append(preArgs, gitHTTPTimeoutFlags()...)
+		// URL credentials. CredentialHelperArgs clears inherited helpers and
+		// installs ours for this single invocation. Shared with the
+		// team-context two-phase clone so the two paths cannot drift.
+		cloneArgs := append(gitserver.CredentialHelperArgs(), gitHTTPTimeoutFlags()...)
 		// Belt-and-suspenders hardening on the daemon's auto-clone path:
 		//   - protocol.{file,ext}.allow=never disables ext::sh:// transport (CVE-2017-1000117
 		//     class) and file:// fetch from submodules / .gitmodules, even though we already
@@ -1912,7 +1965,10 @@ func (s *SyncScheduler) Checkout(payload CheckoutPayload, progress *ProgressWrit
 			"-c", "protocol.ext.allow=never",
 			"clone", "--quiet", "--", cloneURL, payload.RepoPath,
 		)
-		cloneCmd := exec.CommandContext(ctx, "git", cloneArgs...)
+		// NewNetworkCmd sets GIT_TERMINAL_PROMPT=0 so a credential gap fails
+		// fast instead of EOFing on a username prompt in the daemon's TTY-less
+		// environment.
+		cloneCmd := gitutil.NewNetworkCmd(ctx, cloneArgs...)
 		// set cmd.Dir so git doesn't fail when daemon CWD has been deleted
 		if parentDir := filepath.Dir(payload.RepoPath); parentDir != "" {
 			_ = os.MkdirAll(parentDir, 0755)
@@ -2010,8 +2066,10 @@ func (s *SyncScheduler) remoteRefCheck(ctx context.Context, repoPath string) boo
 		remoteRef = "refs/heads/" + strings.TrimPrefix(upstream, "origin/")
 	}
 
-	// git ls-remote origin <ref> — single HTTP round-trip, no local locks
-	lsCmd := exec.CommandContext(lsCtx, "git", "-C", repoPath, "ls-remote", "origin", remoteRef)
+	// git ls-remote origin <ref> — single HTTP round-trip, no local locks.
+	// NewNetworkCmd disables the credential prompt so a missing/expired PAT
+	// fails fast here instead of hanging, then falls through to the full fetch.
+	lsCmd := gitutil.NewNetworkCmd(lsCtx, "-C", repoPath, "ls-remote", "origin", remoteRef)
 	lsOut, err := lsCmd.Output()
 	if err != nil {
 		s.logger.Debug("ls-remote failed, falling through to fetch", "path", repoPath, "error", err)

@@ -45,6 +45,7 @@ const (
 	CapSubagentController = "subagent_controller"
 	CapRulesInstaller     = "rules_installer"
 	CapCommandsInstaller  = "commands_installer"
+	CapSkillsInstaller    = "skills_installer"
 	CapCapturePrior       = "capture_prior"
 )
 
@@ -155,6 +156,33 @@ type CheckCommandsResponse struct {
 
 // UninstallCommandsResponse is returned by `uninstall-commands`.
 type UninstallCommandsResponse struct {
+	Uninstalled  bool     `json:"uninstalled"`
+	FilesRemoved []string `json:"files_removed"`
+}
+
+// SkillsParams are passed to install-skills, check-skills, and uninstall-skills.
+type SkillsParams struct {
+	RepoRoot string `json:"repo_root"`
+	Version  string `json:"version"` // ox version for stamped content
+}
+
+// InstallSkillsResponse is returned by `install-skills`.
+type InstallSkillsResponse struct {
+	Installed    bool     `json:"installed"`
+	FilesWritten []string `json:"files_written"`
+}
+
+// CheckSkillsResponse is returned by `check-skills`.
+type CheckSkillsResponse struct {
+	Installed bool     `json:"installed"`
+	Missing   []string `json:"missing,omitempty"`
+	Stale     []string `json:"stale,omitempty"`
+	SkillsDir string   `json:"skills_dir"`
+	Total     int      `json:"total"`
+}
+
+// UninstallSkillsResponse is returned by `uninstall-skills`.
+type UninstallSkillsResponse struct {
 	Uninstalled  bool     `json:"uninstalled"`
 	FilesRemoved []string `json:"files_removed"`
 }
@@ -304,8 +332,8 @@ type EntriesEventData struct {
 
 // Event names emitted by adapters.
 const (
-	EventEntries        = "entries"
-	EventTerminalError  = "terminal_error"
+	EventEntries       = "entries"
+	EventTerminalError = "terminal_error"
 )
 
 // TerminalErrorSource identifies how a terminal condition was detected.
@@ -335,15 +363,15 @@ const (
 // time — the UI falls back to ResetsAtRaw verbatim. Both may be empty
 // when no reset hint was present in the matched text.
 type TerminalErrorData struct {
-	Reason       string     `json:"reason"`
-	Source       string     `json:"source"` // see TerminalSource* constants
-	PatternID    string     `json:"pattern_id,omitempty"`
-	RawMessage   string     `json:"raw_message"` // capped at 512 bytes
-	ResetsAtRaw  string     `json:"resets_at_raw,omitempty"`
-	ResetsAt     *time.Time `json:"resets_at,omitempty"`
-	EntrySeq     int64      `json:"entry_seq,omitempty"`
-	DetectedAt   time.Time  `json:"detected_at"`
-	ConfirmedAt  time.Time  `json:"confirmed_at"`
+	Reason      string     `json:"reason"`
+	Source      string     `json:"source"` // see TerminalSource* constants
+	PatternID   string     `json:"pattern_id,omitempty"`
+	RawMessage  string     `json:"raw_message"` // capped at 512 bytes
+	ResetsAtRaw string     `json:"resets_at_raw,omitempty"`
+	ResetsAt    *time.Time `json:"resets_at,omitempty"`
+	EntrySeq    int64      `json:"entry_seq,omitempty"`
+	DetectedAt  time.Time  `json:"detected_at"`
+	ConfirmedAt time.Time  `json:"confirmed_at"`
 }
 
 // --- Serve mode method names ---

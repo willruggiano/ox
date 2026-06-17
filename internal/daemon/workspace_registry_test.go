@@ -526,6 +526,55 @@ func TestUpdateConfigLastSync_PreservesLedgerPath(t *testing.T) {
 		"last_sync should be set after UpdateConfigLastSync")
 }
 
+// TestUpdateLastGC_PersistsAcrossReload verifies GC timestamps survive a daemon
+// restart. Failure prevented: LastGCTime lived only in memory, so every restart
+// zeroed it, made every workspace look "gc due", and re-recloned all repos —
+// defeating the gc_interval_days cadence.
+func TestUpdateLastGC_PersistsAcrossReload(t *testing.T) {
+	projectDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(projectDir, ".sageox"), 0755))
+
+	ledgerPath := filepath.Join(t.TempDir(), "ledger")
+	require.NoError(t, os.MkdirAll(filepath.Join(ledgerPath, ".git"), 0755))
+	teamPath := filepath.Join(t.TempDir(), "team")
+	require.NoError(t, os.MkdirAll(filepath.Join(teamPath, ".git"), 0755))
+
+	// seed config with a ledger + one team context, no GC recorded yet
+	localCfg := &config.LocalConfig{
+		Ledger: &config.LedgerConfig{Path: ledgerPath},
+		TeamContexts: []config.TeamContext{
+			{TeamID: "team-1", TeamName: "Team One", Path: teamPath},
+		},
+	}
+	require.NoError(t, config.SaveLocalConfig(projectDir, localCfg))
+
+	reg := NewWorkspaceRegistry(projectDir, "test-repo")
+	reg.configCacheDuration = 1 * time.Hour // keep cache warm
+	require.NoError(t, reg.LoadFromConfig())
+
+	// record GC for both workspaces
+	reg.UpdateLastGC("ledger")
+	reg.UpdateLastGC("team-1")
+
+	// it must be written to disk, not just the in-memory map
+	reloaded, err := config.LoadLocalConfig(projectDir)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded.Ledger)
+	assert.False(t, reloaded.Ledger.LastGC.IsZero(), "ledger last_gc should persist to disk")
+	require.Len(t, reloaded.TeamContexts, 1)
+	assert.False(t, reloaded.TeamContexts[0].LastGC.IsZero(), "team context last_gc should persist to disk")
+
+	// a fresh registry (simulating a daemon restart) must backfill LastGCTime
+	// from disk so the workspaces are no longer treated as overdue
+	fresh := NewWorkspaceRegistry(projectDir, "test-repo")
+	fresh.configCacheDuration = 1 * time.Hour
+	require.NoError(t, fresh.LoadFromConfig())
+	assert.False(t, fresh.GetLastGCTime("ledger").IsZero(),
+		"restart must backfill ledger LastGCTime from config")
+	assert.False(t, fresh.GetLastGCTime("team-1").IsZero(),
+		"restart must backfill team context LastGCTime from config")
+}
+
 func TestExponentialBackoff_Cap(t *testing.T) {
 	t.Parallel()
 	base := time.Minute

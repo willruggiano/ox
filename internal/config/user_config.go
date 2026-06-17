@@ -344,13 +344,17 @@ type UserConfig struct {
 	// UserPromptSubmit cloud_query opt-in; see HooksConfig for rationale.
 	Hooks *HooksConfig `yaml:"hooks,omitempty"`
 
+	// Plan holds the user-level `plan.*` settings for the `ox plan` feature.
+	// Pointer so an absent block is distinguishable from explicit zero-values.
+	Plan *PlanConfig `yaml:"plan,omitempty"`
+
 	// Ephemeral is the persisted user preference for ephemeral mode (no
 	// daemon, no local ledger clone, HTTP-only reads). Pointer so we can
 	// distinguish unset (nil) from explicit false. When non-nil, the value
 	// is published to internal/ephemeral at load time via
 	// ephemeral.SetUserConfigPreference, which treats it as the
 	// lowest-precedence signal — any env var, venue marker, or CI
-	// signal still overrides it. See docs/ai/adr/adr-ephemeral-mode.md.
+	// signal still overrides it. See docs/adr/adr-ephemeral-mode.md.
 	Ephemeral *bool `yaml:"ephemeral,omitempty"`
 
 	// PATExpiryWarningThresholdPct is the fraction of token lifetime remaining

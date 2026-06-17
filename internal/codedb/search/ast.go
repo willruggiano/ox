@@ -70,6 +70,12 @@ type Filters struct {
 	Depth       int // for multi-hop calls:/calledby: (default 1, max 10)
 	CommentKind string
 	State       string
+	// Confidence is the minimum confidence threshold for ADR-019 symbol_edges
+	// queries. Values: "extracted" | "inferred" | "ambiguous". When set,
+	// calls:/calledby: query the resolved symbol_edges table instead of the
+	// LIKE-name-match path on symbol_refs. Empty (default) keeps the existing
+	// name-match behavior so older codedbs (no edges yet) still work.
+	Confidence string
 }
 
 // ParsedQuery is the result of parsing a query string.

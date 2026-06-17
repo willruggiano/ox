@@ -53,6 +53,10 @@ type LocalConfig struct {
 type LedgerConfig struct {
 	Path     string    `toml:"path"`
 	LastSync time.Time `toml:"last_sync"`
+	// LastGC records when the daemon last completed a blue-green GC reclone.
+	// Persisted so the gc_interval_days cadence survives daemon restarts.
+	// omitempty intentionally omitted (see LastSync note above).
+	LastGC time.Time `toml:"last_gc"`
 }
 
 // HasLastSync returns true if LastSync has been set (is non-zero).
@@ -69,6 +73,10 @@ type TeamContext struct {
 	Slug     string    `toml:"slug,omitempty"`
 	Path     string    `toml:"path"`
 	LastSync time.Time `toml:"last_sync"`
+	// LastGC records when the daemon last completed a blue-green GC reclone.
+	// Persisted so the gc_interval_days cadence survives daemon restarts.
+	// omitempty intentionally omitted (see LastSync note above).
+	LastGC time.Time `toml:"last_gc"`
 }
 
 // HasLastSync returns true if LastSync has been set (is non-zero).
@@ -419,6 +427,15 @@ func (c *LocalConfig) UpdateLedgerLastSync() {
 	c.Ledger.LastSync = time.Now().UTC()
 }
 
+// UpdateLedgerLastGC records when the daemon last GC-recloned the ledger.
+// No-ops if Ledger is nil (consistent with UpdateLedgerLastSync behavior).
+func (c *LocalConfig) UpdateLedgerLastGC() {
+	if c.Ledger == nil {
+		return
+	}
+	c.Ledger.LastGC = time.Now().UTC()
+}
+
 // GetTeamContext returns the team context config for the given team ID, or nil if not found.
 func (c *LocalConfig) GetTeamContext(teamID string) *TeamContext {
 	if c == nil {
@@ -462,6 +479,16 @@ func (c *LocalConfig) UpdateTeamContextLastSync(teamID string) {
 	for i := range c.TeamContexts {
 		if c.TeamContexts[i].TeamID == teamID {
 			c.TeamContexts[i].LastSync = time.Now().UTC()
+			return
+		}
+	}
+}
+
+// UpdateTeamContextLastGC records when the daemon last GC-recloned a team context.
+func (c *LocalConfig) UpdateTeamContextLastGC(teamID string) {
+	for i := range c.TeamContexts {
+		if c.TeamContexts[i].TeamID == teamID {
+			c.TeamContexts[i].LastGC = time.Now().UTC()
 			return
 		}
 	}

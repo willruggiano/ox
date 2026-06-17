@@ -190,6 +190,13 @@ func ParseQuery(input string) (*ParsedQuery, error) {
 				filters.CommentKind = value
 			case !negated && key == "state":
 				filters.State = value
+			case !negated && key == "confidence":
+				switch value {
+				case "extracted", "inferred", "ambiguous":
+					filters.Confidence = value
+				default:
+					return nil, fmt.Errorf("confidence: must be extracted|inferred|ambiguous, got '%s'", value)
+				}
 			case negated:
 				return nil, fmt.Errorf("negation not supported for '%s:'", key)
 			default:

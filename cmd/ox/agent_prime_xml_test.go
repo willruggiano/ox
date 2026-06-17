@@ -3,9 +3,13 @@ package main
 import (
 	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/sageox/ox/internal/agenttask"
 	"github.com/sageox/ox/internal/claude"
 	"github.com/sageox/ox/internal/config"
 	"github.com/sageox/ox/internal/prime"
@@ -478,6 +482,24 @@ func TestOutputAgentPrimeXML_ConsultFirst(t *testing.T) {
 		t.Error("consult-first must route code-provenance cues to `ox code search`")
 	}
 
+	// the Layer-1 floor must stand ALONE on Codex/Droid: no Claude-only skill or
+	// slash-command references. The consult reflex is hybrid — a thin `ox-consult`
+	// skill adds Claude auto-activation ergonomics on top — but the floor block
+	// must never point at it, or a Codex/Droid agent reads a dangling reference to
+	// a surface it can't load. Assert the block carries neither "skill" nor "/ox-".
+	consultStart := strings.Index(xml, "<consult-first>")
+	consultEnd := strings.Index(xml, "</consult-first>")
+	if consultStart < 0 || consultEnd < 0 || consultEnd < consultStart {
+		t.Fatal("malformed <consult-first> block")
+	}
+	block := xml[consultStart:consultEnd]
+	if strings.Contains(block, "skill") {
+		t.Error("consult-first floor must not reference a Claude-only skill — it must stand alone on Codex/Droid")
+	}
+	if strings.Contains(block, "/ox-") {
+		t.Error("consult-first floor must not reference a /ox- slash command — it must stand alone on Codex/Droid")
+	}
+
 	// must sit in the static (cacheable) tier — above all per-session content.
 	// The cache boundary itself is a source comment (not emitted), so anchor on
 	// <session-context>, the first per-session block in the output.
@@ -489,6 +511,213 @@ func TestOutputAgentPrimeXML_ConsultFirst(t *testing.T) {
 	if consultIdx > sessionIdx {
 		t.Error("consult-first must be above the per-session block (static tier)")
 	}
+}
+
+// TestOutputAgentPrimeXML_PlanEnrichmentGuidance verifies the
+// <plan-enrichment-guidance> advisory renders on every prime payload and
+// scales to the agent tier: full block (with the `ox plan review` loop)
+// for Gold/Silver/unknown-baseline, lighter for Bronze.
+// Failure prevented: the block silently dropping, or a Bronze agent being
+// promised a review loop its lifecycle can't drive.
+func TestOutputAgentPrimeXML_PlanEnrichmentGuidance(t *testing.T) {
+	tests := []struct {
+		name        string
+		agentType   string
+		wantFull    bool // full block includes the HTML-render recommendation
+		wantCommand string
+	}{
+		{"gold claude-code", "claude-code", true, "`ox plan enrich`"},
+		{"silver codex", "codex", true, "`ox plan enrich`"},
+		{"bronze amp", "amp", false, "`ox plan enrich`"},
+		{"unknown baseline", "some-future-agent", true, "`ox plan enrich`"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			cmd := &cobra.Command{}
+			cmd.SetOut(&buf)
+
+			out := agentPrimeOutput{AgentID: "a", Status: "fresh", AgentType: tt.agentType}
+			if _, err := outputAgentPrimeXML(cmd, out); err != nil {
+				t.Fatalf("outputAgentPrimeXML() error = %v", err)
+			}
+			xml := buf.String()
+
+			// block always present, on every payload
+			if !strings.Contains(xml, "<plan-enrichment-guidance>") {
+				t.Fatal("prime output missing <plan-enrichment-guidance> block")
+			}
+			if !strings.Contains(xml, "</plan-enrichment-guidance>") {
+				t.Error("plan-enrichment-guidance block not closed")
+			}
+
+			// always routes to `ox plan enrich` as the (JSON-default) enrich verb
+			if !strings.Contains(xml, tt.wantCommand) {
+				t.Errorf("plan-enrichment-guidance must mention %s", tt.wantCommand)
+			}
+
+			// the review loop is the differentiator: full tiers recommend the
+			// `ox plan review` loop; Bronze (lighter) does not.
+			hasReviewLoop := strings.Contains(xml, "ox plan review")
+			if tt.wantFull && !hasReviewLoop {
+				t.Error("full-tier block must recommend the `ox plan review` loop")
+			}
+			if !tt.wantFull {
+				if hasReviewLoop {
+					t.Error("bronze block must NOT promise the review loop")
+				}
+				if !strings.Contains(xml, "ox plan list") {
+					t.Error("bronze block must point at `ox plan list` to browse prior plans")
+				}
+			}
+
+			// must sit in the static (cacheable) tier — above per-session content
+			blockIdx := strings.Index(xml, "<plan-enrichment-guidance>")
+			sessionIdx := strings.Index(xml, "<session-context")
+			if sessionIdx >= 0 && blockIdx > sessionIdx {
+				t.Error("plan-enrichment-guidance must be above the per-session block")
+			}
+		})
+	}
+}
+
+// TestConsultRoutes_NoDriftWithSkill is the conformance contract between the
+// Layer-1 <consult-first> floor reminder and the additive `ox-consult` Claude
+// skill: both render the SAME retrieval reflex, so the skill's activation
+// description must name every corpus the floor table routes to. If a future
+// edit drops a route from the skill's frontmatter (or adds one the floor
+// doesn't carry), the two reflexes diverge — the exact drift the single-source
+// capability table exists to prevent.
+// Failure prevented: the consult reflex fires twice with different cue/route
+// lists, or the skill silently stops covering a floor cue.
+func TestConsultRoutes_NoDriftWithSkill(t *testing.T) {
+	routes := consultRoutes()
+	if len(routes) == 0 {
+		t.Fatal("expected consult routes from the floor table; got none")
+	}
+
+	// read the additive skill's frontmatter description (YAML between the first
+	// two --- fences). Path resolves from cmd/ox/ → repo root → extensions/...
+	root, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	skillPath := filepath.Join(root, "extensions", "claude", "skills", "ox-consult", "SKILL.md")
+	raw, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", skillPath, err)
+	}
+	desc := skillFrontmatterDescription(t, string(raw))
+	if desc == "" {
+		t.Fatalf("ox-consult SKILL.md has no frontmatter description")
+	}
+
+	// every corpus command the floor table routes to must be named in the
+	// skill's activation description, so the skill cannot drop a floor cue.
+	// We compare on the leading `ox <subcommand>` token of each route — the
+	// stable routing key, robust to flag/phrasing differences between the
+	// (longer) floor line and the (terser) skill description.
+	for _, r := range routes {
+		corpus := leadingOxCommand(r.Command)
+		if corpus == "" {
+			t.Errorf("route %q has no leading `ox ...` corpus command in %q", r.Cue, r.Command)
+			continue
+		}
+		if !strings.Contains(desc, corpus) {
+			t.Errorf("ox-consult skill description drifted: floor routes to %q but the skill frontmatter does not name it.\n"+
+				"floor cue: %s\nskill description: %s", corpus, r.Cue, desc)
+		}
+	}
+
+	// reverse direction: the skill description must not name an `ox ...` corpus
+	// the floor table doesn't carry. Without this, the skill could quietly add a
+	// retrieval route the floor reminder never fires — the two reflexes diverge
+	// in the other direction, which the forward loop above cannot catch.
+	routeCorpora := map[string]struct{}{}
+	for _, r := range routes {
+		if c := leadingOxCommand(r.Command); c != "" {
+			routeCorpora[c] = struct{}{}
+		}
+	}
+	re := regexp.MustCompile("`ox[^`]*`")
+	for _, token := range re.FindAllString(desc, -1) {
+		c := leadingOxCommand(token)
+		if c == "" {
+			continue
+		}
+		if _, ok := routeCorpora[c]; !ok {
+			t.Errorf("ox-consult skill description includes %q not present in floor consult routes", c)
+		}
+	}
+}
+
+// skillFrontmatterDescription returns the value of the `description:` key in a
+// SKILL.md YAML frontmatter block, with folded-scalar line continuations joined
+// into a single space-separated string. Tiny purpose-built parser — avoids a
+// YAML dependency for one field in a test.
+func skillFrontmatterDescription(t *testing.T, content string) string {
+	t.Helper()
+	lines := strings.Split(content, "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "---" {
+		t.Fatalf("SKILL.md missing opening --- frontmatter fence")
+	}
+	var inDesc bool
+	var parts []string
+	for _, line := range lines[1:] {
+		if strings.TrimSpace(line) == "---" {
+			break // end of frontmatter
+		}
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "description:"):
+			inDesc = true
+			// strip key and any inline scalar marker (>- / | / quotes)
+			rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "description:"))
+			rest = strings.TrimLeft(rest, ">|-")
+			rest = strings.TrimSpace(rest)
+			if rest != "" {
+				parts = append(parts, rest)
+			}
+		case inDesc && strings.HasPrefix(line, " "):
+			// folded continuation line of the description value
+			parts = append(parts, trimmed)
+		case inDesc:
+			// a new top-level key ends the description block
+			inDesc = false
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// leadingOxCommand extracts the `ox <subcommand>` corpus token from the start of
+// a routed-command string (e.g. "`ox session list --limit 20 ...`" → "ox session
+// list"). Returns "" if the string does not begin with a backtick-quoted ox
+// command. Used to compare the floor routing table against the skill description
+// on the stable subcommand key, ignoring trailing flags/prose.
+func leadingOxCommand(command string) string {
+	command = strings.TrimSpace(command)
+	if !strings.HasPrefix(command, "`ox ") {
+		return ""
+	}
+	inner := command[1:] // drop leading backtick
+	if end := strings.IndexByte(inner, '`'); end >= 0 {
+		inner = inner[:end]
+	}
+	// keep the first three space-delimited tokens at most: `ox <verb> <noun>`
+	fields := strings.Fields(inner)
+	if len(fields) > 3 {
+		fields = fields[:3]
+	}
+	// drop a trailing token that is a flag or a quoted arg placeholder
+	for len(fields) > 2 {
+		last := fields[len(fields)-1]
+		if strings.HasPrefix(last, "-") || strings.HasPrefix(last, `"`) {
+			fields = fields[:len(fields)-1]
+			continue
+		}
+		break
+	}
+	return strings.Join(fields, " ")
 }
 
 func TestEscapeXML_AllSpecialChars(t *testing.T) {
@@ -734,9 +963,23 @@ func TestOutputAgentPrimeXML_SageoxOverheadBudget_Regression(t *testing.T) {
 	// As of this test landing, minimal sageox overhead measured roughly
 	// 600 tokens (instructions + attribution + rule-promotion-guidance +
 	// session-context + immediate-actions + budget block itself).
-	// The 1500-token ceiling gives ~2.5x headroom; crossing it should
-	// trigger an explicit decision-and-review, not silent acceptance.
-	const sageoxOverheadCeiling = 1500
+	// The ceiling gives ~2.5x headroom; crossing it should trigger an
+	// explicit decision-and-review, not silent acceptance.
+	//
+	// Raised 1500 -> 1550 (ox-nut2): the <plan-enrichment-guidance> block gained
+	// the explicit two-beat framing (enrich --json WHILE drafting, render a
+	// "SageOx team-context-optimized plan" on present) AND the offer-the-live-
+	// review-loop guidance (proactively offer `ox plan review`, run on the
+	// human's yes) — the headline of that change. ~42 tokens on every Gold
+	// session, deliberately accepted for a high-value collaboration loop.
+	//
+	// Raised 1550 -> 1610 (ox-0d2a): the guidance now tells agents NOT to
+	// hand-author their own SageOx credit or footnote/ⓘ markers — `ox plan
+	// render` deterministically owns the footer credit and auto-injects an OX
+	// marker on references it surfaced context for; the rest use the
+	// `ox plan viz ox-annotation` pattern. ~51 tokens, accepted to stop agents
+	// shipping context-blind brand look-alikes that compete with ox's own.
+	const sageoxOverheadCeiling = 1610
 	sageoxTokens := budget.Get(prime.BudgetSourceSageox)
 	if sageoxTokens > sageoxOverheadCeiling {
 		t.Errorf("SageOx overhead floor for minimal prime = %d tokens, exceeds ceiling %d.\n"+
@@ -825,5 +1068,73 @@ func TestOutputAgentPrimeXML_TeamRules_AlwaysAndIndexed(t *testing.T) {
 	}
 	if !strings.Contains(xml, `estimated_always_tokens="12"`) {
 		t.Error("budget should report estimated tokens for always-tier")
+	}
+}
+
+// TestOutputAgentPrimeXML_AgentTasksSurfaced verifies scheduled agent tasks are
+// surfaced in <immediate-actions> at prime time — the universal delivery channel
+// that reaches every adapter (not just those with a mid-session push hook).
+func TestOutputAgentPrimeXML_AgentTasksSurfaced(t *testing.T) {
+	var buf bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&buf)
+
+	if _, err := outputAgentPrimeXML(cmd, agentPrimeOutput{
+		AgentID:         "test-agent",
+		Status:          "fresh",
+		AgentTasksReady: 3,
+	}); err != nil {
+		t.Fatalf("outputAgentPrimeXML: %v", err)
+	}
+	xml := buf.String()
+	start := strings.Index(xml, "<immediate-actions>")
+	end := strings.Index(xml, "</immediate-actions>")
+	if start < 0 || end < 0 {
+		t.Fatal("expected <immediate-actions> block when AgentTasksReady > 0")
+	}
+	block := xml[start:end]
+	if !strings.Contains(block, "3 scheduled agent task") {
+		t.Errorf("expected task count in actions, got: %s", block)
+	}
+	if !strings.Contains(block, "tasks next") {
+		t.Errorf("expected claim instruction in actions, got: %s", block)
+	}
+
+	// zero ready → no task action
+	buf.Reset()
+	cmd2 := &cobra.Command{}
+	cmd2.SetOut(&buf)
+	if _, err := outputAgentPrimeXML(cmd2, agentPrimeOutput{AgentID: "a", Status: "fresh"}); err != nil {
+		t.Fatalf("outputAgentPrimeXML: %v", err)
+	}
+	if strings.Contains(buf.String(), "scheduled agent task") {
+		t.Error("no task action expected when AgentTasksReady == 0")
+	}
+}
+
+// TestCountReadyAgentTasks_AgentTypeFiltered verifies prime's task count honors
+// target_agent so an agent is only nudged about work it can actually claim.
+func TestCountReadyAgentTasks_AgentTypeFiltered(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".sageox"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agenttask.Enqueue(root, &agenttask.Task{Title: "anyone", Priority: 5}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if _, err := agenttask.Enqueue(root, &agenttask.Task{Title: "codex-only", TargetAgent: "codex", Priority: 1}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	if got := countReadyAgentTasks(root, "claude"); got != 1 {
+		t.Errorf("claude should see only the untargeted task, got %d", got)
+	}
+	if got := countReadyAgentTasks(root, "codex"); got != 2 {
+		t.Errorf("codex should see both tasks, got %d", got)
+	}
+	// empty queue dir / no queue → 0, and must not create the dir
+	empty := t.TempDir()
+	if got := countReadyAgentTasks(empty, "claude"); got != 0 {
+		t.Errorf("expected 0 for absent queue, got %d", got)
 	}
 }

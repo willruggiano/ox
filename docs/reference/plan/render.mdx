@@ -1,0 +1,38 @@
+---
+title: "ox plan render"
+description: "CLI reference for ox plan render"
+sidebar_position: 70
+---
+
+## ox plan render
+
+Render a plan to a self-contained HTML page
+
+```
+ox plan render [slug] [flags]
+```
+
+### Options
+
+```
+      --file string     plan source file when no slug is given (default: stdin, else newest ~/.claude/plans/*.md)
+  -h, --help            help for render
+      --open            open the rendered HTML in your browser
+  -o, --output string   write the rendered HTML to this path
+```
+
+### Options inherited from parent commands
+
+```
+  -c, --config string    config file path (default: .sageox/config.yaml)
+      --json             output in JSON format (default: false)
+      --no-interactive   disable spinners and TUI elements (auto-enabled when CI=true)
+      --profile          generate CPU profile and execution trace for performance analysis (default: false)
+  -q, --quiet            suppress non-error output (default: false)
+  -v, --verbose          enable verbose output (default: false)
+```
+
+### SEE ALSO
+
+* [ox plan](/plan)	 - Work with implementation plans (enrich, render, review)
+

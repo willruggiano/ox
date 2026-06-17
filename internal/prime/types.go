@@ -373,6 +373,11 @@ type Output struct {
 	// Doctor agent marker
 	NeedsDoctorAgent bool   `json:"needs_doctor_agent,omitempty"` // true if .needs-doctor-agent marker exists
 	DoctorHint       string `json:"doctor_hint,omitempty"`        // hint for agent to run ox agent doctor
+	// Scheduled agent tasks ready for THIS agent to claim. Surfacing them at
+	// prime time is the universal delivery channel: every adapter runs `ox agent
+	// prime` at session start, so even agents without a per-prompt push hook
+	// (the mid-session channel, claude-code/codex) still learn about queued work.
+	AgentTasksReady int `json:"agent_tasks_ready,omitempty"`
 	// Observation recording directive (behavioral, not just a tool reference)
 	ObservationDirective string `json:"observation_directive,omitempty"` // proactive instruction to record observations via ox memory put
 	// Murmur directive (behavioral — set when murmuring: "auto")
@@ -400,6 +405,6 @@ type Output struct {
 	Timing    map[string]int64 `json:"timing,omitempty"`     // per-phase timing (ms)
 	// Ephemeral-mode hint: nil when not in ephemeral mode. When set, agents
 	// should prefer the cloud MCP server for context ops since local caches
-	// are sparse. See docs/ai/adr/adr-ephemeral-mode.md.
+	// are sparse. See docs/adr/adr-ephemeral-mode.md.
 	EphemeralHint *EphemeralHint `json:"ephemeral_hint,omitempty"`
 }
